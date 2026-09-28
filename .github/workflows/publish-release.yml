@@ -118,8 +118,8 @@ jobs:
             release_flags+=(--prerelease)
           fi
           gh release create "$RELEASE_TAG" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
             --target "$RELEASE_SHA" \
             --title "Rufus++ v$RELEASE_VERSION" \
             --notes-file release-notes.md \
             "${release_flags[@]}"
-
