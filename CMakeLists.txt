@@ -109,7 +109,7 @@ if(RUFUSPP_BUILD_QT_APP)
   set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
       "Cross-platform boot-media utility")
   set(CPACK_PACKAGE_HOMEPAGE_URL
-      "https://github.com/farrell236/rufus")
+      "https://github.com/farrell236/rufuspp")
   set(CPACK_PACKAGE_VERSION "${RUFUSPP_BUILD_VERSION}")
   set(CPACK_PACKAGE_FILE_NAME "${RUFUSPP_PACKAGE_FILE_NAME}")
   set(CPACK_PACKAGE_DIRECTORY "${CMAKE_BINARY_DIR}/packages")

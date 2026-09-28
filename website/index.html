@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <meta name="description" content="Rufus++ is a cross-platform utility for creating and inspecting bootable media.">
+    <meta name="theme-color" content="#f5f5f7" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#151516" media="(prefers-color-scheme: dark)">
+    <meta property="og:title" content="Rufus++">
+    <meta property="og:description" content="A cross-platform utility for creating and inspecting bootable media.">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://farrell236.github.io/rufuspp/">
+    <title>Rufus++</title>
+    <link rel="icon" href="assets/rufus-128.png" sizes="128x128">
+    <link rel="apple-touch-icon" href="assets/rufus-256.png">
+    <link rel="stylesheet" href="styles.css">
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+
+    <header class="site-header">
+      <nav class="nav-shell" aria-label="Primary navigation">
+        <a class="brand" href="#about" aria-label="Rufus++ home">
+          <img src="assets/rufus-64.png" width="28" height="28" alt="">
+          <span>Rufus++</span>
+        </a>
+        <div class="nav-tabs" aria-label="Page sections">
+          <a href="#about" aria-current="page">About</a>
+          <a href="#download">Download</a>
+          <a href="#changelog">Changelog</a>
+          <a href="#usage">Usage</a>
+          <a href="#features">Features</a>
+          <a href="#source">Source Code</a>
+        </div>
+      </nav>
+    </header>
+
+    <main id="main-content">
+      <section class="intro" id="about" aria-labelledby="page-title">
+        <div class="intro-copy">
+          <h1 id="page-title">Rufus++</h1>
+          <p class="summary">
+            A cross-platform Qt application for creating, formatting, verifying,
+            and capturing bootable media on Windows, Linux, and macOS.
+          </p>
+          <div class="status-note" role="note">
+            <strong>Status: field-testing preview.</strong>
+            The application is feature-ready, but broad physical-device testing and
+            production macOS signing are still outstanding. Back up important data
+            and verify the selected target before writing.
+          </div>
+          <div class="intro-actions">
+            <a class="button primary" href="#download">Download</a>
+            <a class="button" href="https://github.com/farrell236/rufuspp/blob/master/docs/documentation.md">User guide</a>
+          </div>
+        </div>
+        <figure class="app-preview" aria-labelledby="screenshot-caption">
+          <div class="carousel-frame">
+            <img
+              id="carousel-image"
+              src="assets/windows-installation-mode.png"
+              width="492"
+              height="624"
+              alt="Rufus++ configured to create Windows installation media"
+            >
+          </div>
+          <div class="carousel-caption">
+            <figcaption id="screenshot-caption" aria-live="polite">Windows installation media</figcaption>
+            <div class="carousel-controls">
+              <button class="carousel-button previous" type="button" aria-label="Previous screenshot">←</button>
+              <span id="screenshot-position">1 of 5</span>
+              <button class="carousel-button next" type="button" aria-label="Next screenshot">→</button>
+            </div>
+          </div>
+        </figure>
+      </section>
+
+      <section class="content-section" id="download" aria-labelledby="download-title">
+        <h2 id="download-title">Download</h2>
+
+        <div class="release-banner" id="release-banner" hidden>
+          <div>
+            <strong id="release-name">Rufus++</strong>
+            <span id="release-date"></span>
+          </div>
+          <a id="release-notes-link" href="https://github.com/farrell236/rufuspp/releases">Release notes</a>
+        </div>
+
+        <div class="table-scroll">
+          <table class="download-table" id="download-grid">
+            <thead>
+              <tr>
+                <th scope="col">Platform</th>
+                <th scope="col">Architecture</th>
+                <th scope="col">Package</th>
+                <th scope="col">Download</th>
+                <th scope="col">SHA-256</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr class="download-card" data-asset="windows-x64">
+                <th scope="row">Windows</th>
+                <td data-label="Architecture">x86-64</td>
+                <td data-label="Package">ZIP</td>
+                <td data-label="Download"><a class="download-link is-loading" aria-disabled="true">Checking…</a></td>
+                <td data-label="SHA-256">
+                  <div class="checksum-field is-loading">
+                    <code class="checksum-value">Checking…</code>
+                    <button class="checksum-copy" type="button" disabled>Copy</button>
+                  </div>
+                </td>
+              </tr>
+              <tr class="download-card" data-asset="linux-x64">
+                <th scope="row">Linux</th>
+                <td data-label="Architecture">x86-64</td>
+                <td data-label="Package">tar.gz</td>
+                <td data-label="Download"><a class="download-link is-loading" aria-disabled="true">Checking…</a></td>
+                <td data-label="SHA-256">
+                  <div class="checksum-field is-loading">
+                    <code class="checksum-value">Checking…</code>
+                    <button class="checksum-copy" type="button" disabled>Copy</button>
+                  </div>
+                </td>
+              </tr>
+              <tr class="download-card" data-asset="macos-arm64">
+                <th scope="row">macOS</th>
+                <td data-label="Architecture">Apple silicon</td>
+                <td data-label="Package">DMG</td>
+                <td data-label="Download"><a class="download-link is-loading" aria-disabled="true">Checking…</a></td>
+                <td data-label="SHA-256">
+                  <div class="checksum-field is-loading">
+                    <code class="checksum-value">Checking…</code>
+                    <button class="checksum-copy" type="button" disabled>Copy</button>
+                  </div>
+                </td>
+              </tr>
+              <tr class="download-card" data-asset="macos-x64">
+                <th scope="row">macOS</th>
+                <td data-label="Architecture">Intel</td>
+                <td data-label="Package">DMG</td>
+                <td data-label="Download"><a class="download-link is-loading" aria-disabled="true">Checking…</a></td>
+                <td data-label="SHA-256">
+                  <div class="checksum-field is-loading">
+                    <code class="checksum-value">Checking…</code>
+                    <button class="checksum-copy" type="button" disabled>Copy</button>
+                  </div>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="section-link"><a href="https://github.com/farrell236/rufuspp/blob/master/README.md#build-and-test">Build from source</a></p>
+      </section>
+
+      <section class="content-section" id="changelog" aria-labelledby="changelog-title">
+        <div class="section-header">
+          <h2 id="changelog-title">Changelog</h2>
+          <a href="https://github.com/farrell236/rufuspp/releases">All releases</a>
+        </div>
+        <div class="release-list" id="release-list" aria-live="polite">
+          <article class="empty-release">
+            <h3>Loading published releases…</h3>
+            <p>Release notes will appear here from GitHub.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="content-section" id="usage" aria-labelledby="usage-title">
+        <h2 id="usage-title">Usage</h2>
+        <ol class="usage-list">
+          <li><strong>Connect and select a removable target.</strong> Confirm its model and capacity.</li>
+          <li><strong>Select an image or installer.</strong> Rufus++ analyzes the source and enables applicable options.</li>
+          <li><strong>Review the settings.</strong> Choose the layout, filesystem, format, and verification policy where available.</li>
+          <li><strong>Select Start.</strong> Read the destructive-write summary and confirm the exact target.</li>
+          <li><strong>Wait for completion.</strong> Do not disconnect the device while writing or verification is in progress.</li>
+        </ol>
+        <div class="usage-links">
+          <a href="https://github.com/farrell236/rufuspp/blob/master/docs/documentation.md">Full user guide</a>
+          <a href="https://github.com/farrell236/rufuspp/blob/master/docs/documentation.md#privilege-and-safety-model">Privilege and safety model</a>
+        </div>
+      </section>
+
+      <section class="content-section" id="features" aria-labelledby="features-title">
+        <h2 id="features-title">Features</h2>
+        <ul class="feature-list">
+          <li><strong>Image deployment</strong> — ISO, raw, compressed, VHD, VHDX, and FFU image analysis and writing.</li>
+          <li><strong>Operating-system media</strong> — Windows installation and Windows To Go media, detected Linux persistence, and native macOS installer creation.</li>
+          <li><strong>Disk preparation</strong> — MBR and GPT layouts, BIOS and UEFI targets, standalone formatting, and selectable quick or full format.</li>
+          <li><strong>Blank boot media</strong> — FreeDOS, user-supplied MS-DOS and bootloaders, bundled GRUB2 and Syslinux, UEFI:NTFS, and offline UEFI Shell media.</li>
+          <li><strong>Capture and inspection</strong> — Drive capture to DD, VHD, VHDX, FFU, or UDF ISO where supported, plus read-only device and partition inspection.</li>
+          <li><strong>Verification and safety</strong> — MD5, SHA-1, SHA-256, and SHA-512 checksums, post-write verification, bad-block testing, guarded device access, and destructive-write confirmation.</li>
+        </ul>
+        <p class="section-link"><a href="https://github.com/farrell236/rufuspp/blob/master/docs/features.md">Complete feature reference</a></p>
+      </section>
+
+      <section class="content-section" id="source" aria-labelledby="source-title">
+        <h2 id="source-title">Source code</h2>
+        <p>
+          Rufus++ uses a portable C++17 core, Qt 6 interface, and guarded native
+          device backends for Windows, Linux, and macOS. The source is licensed
+          under GPLv3.
+        </p>
+        <pre><code>git clone https://github.com/farrell236/rufuspp.git</code></pre>
+        <div class="usage-links">
+          <a href="https://github.com/farrell236/rufuspp">GitHub repository</a>
+          <a href="https://github.com/farrell236/rufuspp/blob/master/docs/cross-platform.md">Architecture</a>
+          <a href="https://github.com/farrell236/rufuspp/issues">Issue tracker</a>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <p>Rufus++ is an independent project inspired by Rufus.</p>
+      <p>© <span id="copyright-year">2026</span> Rufus++ contributors · <a href="https://github.com/farrell236/rufuspp/blob/master/LICENSE.txt">GPLv3</a></p>
+    </footer>
+
+    <noscript>
+      <div class="noscript-note">JavaScript is required only for live GitHub Release information.</div>
+    </noscript>
+  </body>
+</html>
