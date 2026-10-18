@@ -2,6 +2,21 @@
 <html lang="en">
   <head>
     <meta charset="utf-8">
+    <!-- Google Analytics runs only on the published Rufus++ website. -->
+    <script>
+      if (window.location.hostname === "farrell236.github.io"
+        && /^\/rufuspp(?:\/|$)/.test(window.location.pathname)) {
+        window.dataLayer = window.dataLayer || [];
+        window.gtag = function () { window.dataLayer.push(arguments); };
+        window.gtag("js", new Date());
+        window.gtag("config", "G-JCH9GMZ9FJ");
+
+        const googleTag = document.createElement("script");
+        googleTag.async = true;
+        googleTag.src = "https://www.googletagmanager.com/gtag/js?id=G-JCH9GMZ9FJ";
+        document.head.appendChild(googleTag);
+      }
+    </script>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
     <meta name="description" content="Rufus++ is a cross-platform utility for creating and inspecting bootable media.">
