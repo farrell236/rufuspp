@@ -48,6 +48,9 @@ ExternalProject_Add(rufus_ntfs_upstream
   UPDATE_COMMAND ""
   CONFIGURE_COMMAND ${CMAKE_COMMAND} -E env
     "CC=${CMAKE_C_COMPILER}" "CFLAGS=${ntfs_cflags}" "LDFLAGS=${ntfs_ldflags}"
+    # A host gettext header can remap libc setlocale without linking libintl.
+    # The private formatter uses no gettext functions or translations.
+    "ac_cv_header_libintl_h=no"
     <SOURCE_DIR>/configure --disable-shared --enable-static --disable-ntfs-3g
     --disable-crypto --disable-plugins --disable-nfconv --disable-ldconfig
     --disable-mount-helper --without-hd --without-uuid
