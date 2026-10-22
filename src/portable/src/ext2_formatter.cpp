@@ -19,6 +19,7 @@
 #include <limits>
 #include <random>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace rufus::core::detail {
@@ -33,7 +34,6 @@ constexpr std::uint32_t kInodeTableBlocks =
     kInodesPerGroup * kInodeBytes / kBlockBytes;
 constexpr std::uint32_t kRootInode = 2;
 constexpr std::uint32_t kFirstRegularInode = 11;
-constexpr std::uint32_t kPersistenceConfInode = 11;
 constexpr std::uint16_t kExt2Magic = 0xef53;
 constexpr std::string_view kPersistenceConfName = "persistence.conf";
 constexpr std::string_view kPersistenceConfData = "/ union\n";
@@ -146,11 +146,86 @@ struct GroupLayout final {
   bool backupSuperblock{};
 };
 
+struct InitialNode final {
+  std::string name;
+  std::size_t parent{};
+  std::uint32_t inode{};
+  std::uint16_t mode{};
+  std::string contents;
+  bool directory() const { return (mode & 0170000U) == 0040000U; }
+};
+
+std::string uuidText(const std::array<unsigned char, 16>& uuid) {
+  constexpr char hex[] = "0123456789abcdef";
+  std::string result;
+  for (std::size_t index = 0; index < uuid.size(); ++index) {
+    if (index == 4U || index == 6U || index == 8U || index == 10U) result += '-';
+    result += hex[uuid[index] >> 4U];
+    result += hex[uuid[index] & 15U];
+  }
+  return result;
+}
+
+std::string casperShutdownScript(const std::array<unsigned char, 16>& uuid) {
+  // Only the generated persistence filesystem can be selected. Duplicate UUIDs
+  // fail closed; an installed OS or non-persistent live boot does nothing.
+  return std::string(
+      "#!/bin/sh\n"
+      "# Rufus++ Casper persistence finalization. No filesystem repair is performed.\n"
+      "set -eu\n"
+      "export PATH=/usr/sbin:/usr/bin:/sbin:/bin\n"
+      "case \"$1\" in poweroff|halt|reboot|kexec) ;; *) exit 0;; esac\n"
+      "grep -Eq '(^|[[:space:]])persistent([[:space:]]|$)' /proc/cmdline || exit 0\n"
+      "[ \"$(findmnt -n -o FSTYPE /)\" = overlay ] || exit 0\n"
+      "uuid='") + uuidText(uuid) +
+      "'\n"
+      "device=$(blkid -c /dev/null -t \"UUID=$uuid\" -o device)\n"
+      "case \"$device\" in ''|*'\n'*) exit 1;; esac\n"
+      "[ -b \"$device\" ]\n"
+      "[ \"$(blkid -s UUID -o value \"$device\")\" = \"$uuid\" ]\n"
+      "[ \"$(blkid -s TYPE -o value \"$device\")\" = ext2 ]\n"
+      "point=/run/rufuspp-persistence-finalize\n"
+      "umask 077\n"
+      "mkdir \"$point\"\n"
+      "mounted=0\n"
+      "trap 'if [ \"$mounted\" = 1 ]; then umount \"$point\" || :; fi; rmdir \"$point\" || :' EXIT\n"
+      "mount -t ext2 -o rw,nodev,nosuid \"$device\" \"$point\"\n"
+      "mounted=1\n"
+      "sync\n"
+      "mount -o remount,ro \"$point\"\n"
+      "umount \"$point\"\n"
+      "mounted=0\n";
+}
+
+std::vector<InitialNode> initialNodes(
+    const Ext2FormatOptions& options, const std::array<unsigned char, 16>& uuid) {
+  std::vector<InitialNode> nodes{{"", 0U, kRootInode, 0040755U, ""}};
+  const auto add = [&](const std::string& name, const std::size_t parent,
+                       const std::uint16_t mode, std::string contents) {
+    nodes.push_back({name, parent,
+                     kFirstRegularInode + static_cast<std::uint32_t>(nodes.size() - 1U),
+                     mode, std::move(contents)});
+    return nodes.size() - 1U;
+  };
+  if (options.createPersistenceConf) {
+    add(std::string(kPersistenceConfName), 0U, 0100644U,
+        std::string(kPersistenceConfData));
+  }
+  if (options.casperShutdownHook) {
+    std::size_t parent = 0U;
+    for (const char* name : {"upper", "usr", "lib", "systemd", "system-shutdown"}) {
+      parent = add(name, parent, 0040755U, "");
+    }
+    add("90-rufuspp-persistence", parent, 0100755U, casperShutdownScript(uuid));
+  }
+  return nodes;
+}
+
 bool makeGroups(const std::uint32_t requestedBlocks,
                 std::uint32_t& filesystemBlocks,
                 std::uint32_t& descriptorBlocks,
                 std::vector<GroupLayout>& groups,
-                const bool persistenceConf, std::string& error) {
+                const std::uint32_t initialNodeCount, std::string& error) {
   filesystemBlocks = requestedBlocks;
   for (;;) {
     const std::uint32_t groupCount =
@@ -193,7 +268,7 @@ bool makeGroups(const std::uint32_t requestedBlocks,
     layout.firstDataBlock = cursor;
     std::uint32_t usedBlocks = cursor - layout.firstBlock;
     if (group == 0U) {
-      usedBlocks += persistenceConf ? 2U : 1U;
+      usedBlocks += initialNodeCount;
     }
     if (usedBlocks >= layout.blockCount ||
         layout.blockCount - usedBlocks > std::numeric_limits<std::uint16_t>::max()) {
@@ -202,8 +277,7 @@ bool makeGroups(const std::uint32_t requestedBlocks,
     }
     layout.freeBlocks = static_cast<std::uint16_t>(layout.blockCount - usedBlocks);
     const std::uint32_t usedInodes = group == 0U
-                                         ? (kFirstRegularInode - 1U) +
-                                               (persistenceConf ? 1U : 0U)
+                                         ? (kFirstRegularInode - 1U) + initialNodeCount - 1U
                                          : 0U;
     layout.freeInodes = static_cast<std::uint16_t>(kInodesPerGroup - usedInodes);
     groups.push_back(layout);
@@ -229,8 +303,8 @@ std::vector<unsigned char> makeSuperblock(
   put32(super.data() + 36, kBlocksPerGroup);
   put32(super.data() + 40, kInodesPerGroup);
   put32(super.data() + 48, timestamp);
-  put16(super.data() + 50, 0);
-  put16(super.data() + 52, 20);
+  put16(super.data() + 52, 0);
+  put16(super.data() + 54, 20);
   put16(super.data() + 56, kExt2Magic);
   put16(super.data() + 58, 1);
   put16(super.data() + 60, 1);
@@ -257,7 +331,8 @@ std::vector<unsigned char> makeSuperblock(
 }
 
 std::vector<unsigned char> makeGroupDescriptors(
-    const std::vector<GroupLayout>& groups, const std::uint32_t descriptorBlocks) {
+    const std::vector<GroupLayout>& groups, const std::uint32_t descriptorBlocks,
+    const std::uint16_t initialDirectories) {
   std::vector<unsigned char> descriptors(
       static_cast<std::size_t>(descriptorBlocks) * kBlockBytes, 0);
   for (std::size_t index = 0; index < groups.size(); ++index) {
@@ -267,7 +342,7 @@ std::vector<unsigned char> makeGroupDescriptors(
     put32(descriptor + 8, groups[index].inodeTable);
     put16(descriptor + 12, groups[index].freeBlocks);
     put16(descriptor + 14, groups[index].freeInodes);
-    put16(descriptor + 16, index == 0U ? 1U : 0U);
+    put16(descriptor + 16, index == 0U ? initialDirectories : 0U);
   }
   return descriptors;
 }
@@ -299,11 +374,57 @@ void writeDirectoryEntry(unsigned char* entry, const std::uint32_t inode,
   std::copy(name.begin(), name.end(), entry + 8);
 }
 
+std::vector<unsigned char> nodeData(const std::vector<InitialNode>& nodes,
+                                    const std::size_t index) {
+  const auto& node = nodes[index];
+  std::vector<unsigned char> data(kBlockBytes, 0);
+  if (!node.directory()) {
+    std::copy(node.contents.begin(), node.contents.end(), data.begin());
+    return data;
+  }
+  struct Entry { std::uint32_t inode; std::string name; unsigned char type; };
+  std::vector<Entry> entries{{node.inode, ".", 2},
+                             {nodes[node.parent].inode, "..", 2}};
+  for (std::size_t child = 1U; child < nodes.size(); ++child) {
+    if (nodes[child].parent == index) {
+      entries.push_back({nodes[child].inode, nodes[child].name,
+                         static_cast<unsigned char>(nodes[child].directory() ? 2U : 1U)});
+    }
+  }
+  std::size_t offset = 0U;
+  for (std::size_t entry = 0U; entry < entries.size(); ++entry) {
+    const auto& value = entries[entry];
+    const auto bytes = static_cast<std::uint16_t>(
+        entry + 1U == entries.size() ? kBlockBytes - offset
+                                     : (8U + value.name.size() + 3U) & ~3U);
+    writeDirectoryEntry(data.data() + offset, value.inode, bytes, value.name, value.type);
+    offset += bytes;
+  }
+  return data;
+}
+
+std::vector<unsigned char> nodeInode(const std::vector<InitialNode>& nodes,
+                                     const std::size_t index,
+                                     const std::uint32_t dataBlock,
+                                     const std::uint32_t timestamp) {
+  const auto& node = nodes[index];
+  std::uint16_t links = node.directory() ? 2U : 1U;
+  if (node.directory()) {
+    for (std::size_t child = 1U; child < nodes.size(); ++child) {
+      if (nodes[child].parent == index && nodes[child].directory()) ++links;
+    }
+  }
+  return makeInode(node.mode, node.directory() ? kBlockBytes
+                    : static_cast<std::uint32_t>(node.contents.size()),
+                   links, dataBlock, timestamp);
+}
+
 }  // namespace
 
 bool writeExt2Filesystem(std::ofstream& output, const Ext2FormatOptions& options,
                          const Ext2CancelCallback& isCancelled,
-                         std::string& error) {
+                         std::string& error,
+                         std::vector<RawWriteRange>* initializedRanges) {
   if (options.offsetBytes % kBlockBytes != 0U ||
       options.sizeBytes < 256ULL * 1024ULL * 1024ULL) {
     error = "Linux persistence requires a 4 KiB-aligned partition of at least 256 MiB";
@@ -318,8 +439,16 @@ bool writeExt2Filesystem(std::ofstream& output, const Ext2FormatOptions& options
   std::uint32_t filesystemBlocks = 0;
   std::uint32_t descriptorBlocks = 0;
   std::vector<GroupLayout> groups;
+  const auto uuid = makeUuid();
+  const auto nodes = initialNodes(options, uuid);
+  for (const auto& node : nodes) {
+    if (node.contents.size() > kBlockBytes) {
+      error = "Initial persistence file exceeds the formatter block limit";
+      return false;
+    }
+  }
   if (!makeGroups(static_cast<std::uint32_t>(requestedBlocks64), filesystemBlocks,
-                  descriptorBlocks, groups, options.createPersistenceConf, error)) {
+                  descriptorBlocks, groups, static_cast<std::uint32_t>(nodes.size()), error)) {
     return false;
   }
   std::uint64_t freeBlocks64 = 0;
@@ -334,9 +463,10 @@ bool writeExt2Filesystem(std::ofstream& output, const Ext2FormatOptions& options
     return false;
   }
 
-  const auto uuid = makeUuid();
   const std::uint32_t timestamp = unixTimeNow();
-  const auto descriptors = makeGroupDescriptors(groups, descriptorBlocks);
+  const auto initialDirectories = static_cast<std::uint16_t>(std::count_if(
+      nodes.begin(), nodes.end(), [](const InitialNode& node) { return node.directory(); }));
+  const auto descriptors = makeGroupDescriptors(groups, descriptorBlocks, initialDirectories);
   for (std::uint32_t groupIndex = 0; groupIndex < groups.size(); ++groupIndex) {
     if (isCancelled && isCancelled()) {
       error = "Linux persistence formatting was cancelled";
@@ -367,9 +497,9 @@ bool writeExt2Filesystem(std::ofstream& output, const Ext2FormatOptions& options
       setBit(blockBitmap, block);
     }
     if (groupIndex == 0U) {
-      setBit(blockBitmap, group.firstDataBlock - group.firstBlock);
-      if (options.createPersistenceConf) {
-        setBit(blockBitmap, group.firstDataBlock - group.firstBlock + 1U);
+      for (std::size_t index = 0U; index < nodes.size(); ++index) {
+        setBit(blockBitmap, group.firstDataBlock - group.firstBlock +
+                                static_cast<std::uint32_t>(index));
       }
     }
     for (std::uint32_t block = group.blockCount; block < kBlocksPerGroup; ++block) {
@@ -384,7 +514,7 @@ bool writeExt2Filesystem(std::ofstream& output, const Ext2FormatOptions& options
     std::vector<unsigned char> inodeBitmap(kBlockBytes, 0);
     if (groupIndex == 0U) {
       const std::uint32_t used = (kFirstRegularInode - 1U) +
-                                 (options.createPersistenceConf ? 1U : 0U);
+                                 static_cast<std::uint32_t>(nodes.size() - 1U);
       for (std::uint32_t inode = 0; inode < used; ++inode) {
         setBit(inodeBitmap, inode);
       }
@@ -401,44 +531,35 @@ bool writeExt2Filesystem(std::ofstream& output, const Ext2FormatOptions& options
   }
 
   const auto& first = groups.front();
-  const std::uint32_t rootDataBlock = first.firstDataBlock;
   const std::uint64_t inodeTableOffset = options.offsetBytes +
       static_cast<std::uint64_t>(first.inodeTable) * kBlockBytes;
-  const auto rootInode = makeInode(0040755U, kBlockBytes, 2, rootDataBlock, timestamp);
-  if (!writeAt(output, inodeTableOffset +
-                           static_cast<std::uint64_t>(kRootInode - 1U) * kInodeBytes,
-               rootInode, error)) {
-    return false;
-  }
-
-  std::vector<unsigned char> rootDirectory(kBlockBytes, 0);
-  writeDirectoryEntry(rootDirectory.data(), kRootInode, 12, ".", 2);
-  if (options.createPersistenceConf) {
-    writeDirectoryEntry(rootDirectory.data() + 12, kRootInode, 12, "..", 2);
-    writeDirectoryEntry(rootDirectory.data() + 24, kPersistenceConfInode,
-                        static_cast<std::uint16_t>(kBlockBytes - 24U),
-                        kPersistenceConfName, 1);
-    const std::uint32_t confDataBlock = rootDataBlock + 1U;
-    const auto confInode = makeInode(
-        0100644U, static_cast<std::uint32_t>(kPersistenceConfData.size()), 1,
-        confDataBlock, timestamp);
+  for (std::size_t index = 0U; index < nodes.size(); ++index) {
+    const auto block = first.firstDataBlock + static_cast<std::uint32_t>(index);
+    const auto inode = nodeInode(nodes, index, block, timestamp);
+    const auto data = nodeData(nodes, index);
     if (!writeAt(output, inodeTableOffset +
-                             static_cast<std::uint64_t>(kPersistenceConfInode - 1U) *
-                                 kInodeBytes,
-                 confInode, error) ||
+                             static_cast<std::uint64_t>(nodes[index].inode - 1U) * kInodeBytes,
+                 inode, error) ||
         !writeAt(output, options.offsetBytes +
-                             static_cast<std::uint64_t>(confDataBlock) * kBlockBytes,
-                 reinterpret_cast<const unsigned char*>(kPersistenceConfData.data()),
-                 kPersistenceConfData.size(), error)) {
+                             static_cast<std::uint64_t>(block) * kBlockBytes,
+                 data, error)) {
       return false;
     }
-  } else {
-    writeDirectoryEntry(rootDirectory.data() + 12, kRootInode,
-                        static_cast<std::uint16_t>(kBlockBytes - 12U), "..", 2);
   }
-  return writeAt(output, options.offsetBytes +
-                             static_cast<std::uint64_t>(rootDataBlock) * kBlockBytes,
-                 rootDirectory, error);
+  if (initializedRanges != nullptr) {
+    // Include whole metadata prefixes, including all zero-filled inode tables
+    // and reserved blocks that exist as holes in the fresh staging file.
+    // Skipping merely zero-valued writes would retain stale allocated metadata.
+    for (std::size_t index = 0U; index < groups.size(); ++index) {
+      const auto& group = groups[index];
+      const auto initializedBlocks = group.firstDataBlock - group.firstBlock +
+          (index == 0U ? static_cast<std::uint32_t>(nodes.size()) : 0U);
+      initializedRanges->push_back({
+          options.offsetBytes + static_cast<std::uint64_t>(group.firstBlock) * kBlockBytes,
+          static_cast<std::uint64_t>(initializedBlocks) * kBlockBytes});
+    }
+  }
+  return true;
 }
 
 bool verifyExt2Filesystem(const std::filesystem::path& imagePath,
@@ -452,7 +573,10 @@ bool verifyExt2Filesystem(const std::filesystem::path& imagePath,
   if (!readAt(input, options.offsetBytes + 1024U, super.data(), super.size()) ||
       get16(super.data() + 56) != kExt2Magic || get32(super.data() + 24) != 2U ||
       get32(super.data() + 32) != kBlocksPerGroup ||
-      get16(super.data() + 88) != kInodeBytes) {
+      get16(super.data() + 88) != kInodeBytes ||
+      get16(super.data() + 52) != 0U || get16(super.data() + 54) != 20U ||
+      get16(super.data() + 58) != 1U ||
+      get32(super.data() + 48) != get32(super.data() + 64)) {
     error = "Linux persistence superblock verification failed";
     return false;
   }
@@ -464,72 +588,48 @@ bool verifyExt2Filesystem(const std::filesystem::path& imagePath,
     return false;
   }
 
-  std::array<unsigned char, 32> descriptor{};
-  if (!readAt(input, options.offsetBytes + kBlockBytes,
-              descriptor.data(), descriptor.size())) {
-    error = "Linux persistence group descriptor verification failed";
+  std::array<unsigned char, 16> uuid{};
+  std::copy_n(super.begin() + 104U, uuid.size(), uuid.begin());
+  const auto nodes = initialNodes(options, uuid);
+  std::uint32_t filesystemBlocks = 0U, descriptorBlocks = 0U;
+  std::vector<GroupLayout> groups;
+  if (options.sizeBytes / kBlockBytes > std::numeric_limits<std::uint32_t>::max() ||
+      !makeGroups(static_cast<std::uint32_t>(options.sizeBytes / kBlockBytes),
+                  filesystemBlocks, descriptorBlocks, groups,
+                  static_cast<std::uint32_t>(nodes.size()), error)) return false;
+  std::uint64_t freeBlocks = 0U, freeInodes = 0U;
+  for (const auto& group : groups) {
+    freeBlocks += group.freeBlocks;
+    freeInodes += group.freeInodes;
+  }
+  const auto initialDirectories = static_cast<std::uint16_t>(std::count_if(
+      nodes.begin(), nodes.end(), [](const InitialNode& node) { return node.directory(); }));
+  const auto descriptors = makeGroupDescriptors(groups, descriptorBlocks, initialDirectories);
+  std::vector<unsigned char> observedDescriptors(descriptors.size());
+  if (get32(super.data() + 4U) != filesystemBlocks ||
+      get32(super.data() + 12U) != freeBlocks || get32(super.data() + 16U) != freeInodes ||
+      !readAt(input, options.offsetBytes + kBlockBytes,
+              observedDescriptors.data(), observedDescriptors.size()) ||
+      observedDescriptors != descriptors) {
+    error = "Linux persistence allocation counter/descriptor verification failed";
     return false;
   }
-  const std::uint32_t inodeTable = get32(descriptor.data() + 8);
-  std::array<unsigned char, kInodeBytes> rootInode{};
-  const std::uint64_t rootInodeOffset = options.offsetBytes +
-      static_cast<std::uint64_t>(inodeTable) * kBlockBytes +
-      static_cast<std::uint64_t>(kRootInode - 1U) * kInodeBytes;
-  if (!readAt(input, rootInodeOffset, rootInode.data(), rootInode.size()) ||
-      (get16(rootInode.data()) & 0170000U) != 0040000U) {
-    error = "Linux persistence root inode verification failed";
-    return false;
-  }
-  const std::uint32_t rootBlock = get32(rootInode.data() + 40);
-  std::vector<unsigned char> directory(kBlockBytes, 0);
-  if (!readAt(input, options.offsetBytes +
-                         static_cast<std::uint64_t>(rootBlock) * kBlockBytes,
-              directory.data(), directory.size())) {
-    error = "Linux persistence root directory verification failed";
-    return false;
-  }
-  if (!options.createPersistenceConf) {
-    return true;
-  }
-
-  std::uint32_t confInodeNumber = 0;
-  for (std::size_t offset = 0; offset + 8U <= directory.size();) {
-    const std::uint32_t inode = get32(directory.data() + offset);
-    const std::uint16_t recordLength = get16(directory.data() + offset + 4U);
-    const std::uint8_t nameLength = directory[offset + 6U];
-    if (recordLength < 8U || offset + recordLength > directory.size() ||
-        nameLength > recordLength - 8U) {
-      break;
+  const auto& first = groups.front();
+  for (std::size_t index = 0U; index < nodes.size(); ++index) {
+    const auto block = first.firstDataBlock + static_cast<std::uint32_t>(index);
+    const auto inode = nodeInode(nodes, index, block, get32(super.data() + 48U));
+    const auto data = nodeData(nodes, index);
+    std::vector<unsigned char> observedInode(inode.size()), observedData(data.size());
+    if (!readAt(input, options.offsetBytes +
+                           static_cast<std::uint64_t>(first.inodeTable) * kBlockBytes +
+                           static_cast<std::uint64_t>(nodes[index].inode - 1U) * kInodeBytes,
+                observedInode.data(), observedInode.size()) ||
+        observedInode != inode ||
+        !readAt(input, options.offsetBytes + static_cast<std::uint64_t>(block) * kBlockBytes,
+                observedData.data(), observedData.size()) || observedData != data) {
+      error = "Linux persistence initial file/directory verification failed: " + nodes[index].name;
+      return false;
     }
-    const std::string_view name(
-        reinterpret_cast<const char*>(directory.data() + offset + 8U), nameLength);
-    if (inode != 0U && name == kPersistenceConfName) {
-      confInodeNumber = inode;
-      break;
-    }
-    offset += recordLength;
-  }
-  if (confInodeNumber != kPersistenceConfInode) {
-    error = "Linux persistence.conf directory entry verification failed";
-    return false;
-  }
-  std::array<unsigned char, kInodeBytes> confInode{};
-  const std::uint64_t confInodeOffset = options.offsetBytes +
-      static_cast<std::uint64_t>(inodeTable) * kBlockBytes +
-      static_cast<std::uint64_t>(confInodeNumber - 1U) * kInodeBytes;
-  if (!readAt(input, confInodeOffset, confInode.data(), confInode.size()) ||
-      get32(confInode.data() + 4) != kPersistenceConfData.size()) {
-    error = "Linux persistence.conf inode verification failed";
-    return false;
-  }
-  std::array<unsigned char, 8> contents{};
-  const std::uint32_t confBlock = get32(confInode.data() + 40);
-  if (!readAt(input, options.offsetBytes +
-                         static_cast<std::uint64_t>(confBlock) * kBlockBytes,
-              contents.data(), contents.size()) ||
-      !std::equal(contents.begin(), contents.end(), kPersistenceConfData.begin())) {
-    error = "Linux persistence.conf content verification failed";
-    return false;
   }
   return true;
 }

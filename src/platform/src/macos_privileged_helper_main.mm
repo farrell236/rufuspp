@@ -26,8 +26,10 @@
 #include <vector>
 
 #include "macos_privileged_helper_protocol.hpp"
+#include "macos_write_ranges.hpp"
 #include "macos_installer_operations.hpp"
 #include "macos_raw_device_operations.hpp"
+#include "raw_write_safety.hpp"
 #include "rufus/core/image_analyzer.hpp"
 #include "rufus/core/write_plan.hpp"
 
@@ -124,6 +126,8 @@ core::RawWriteResult executeWrite(xpc_object_t request,
     return result;
   }
 
+  std::vector<core::RawWriteRange> writeRanges;
+  if (!wire::decodeWriteRanges(request, writeRanges, result.error)) return result;
   const char* sourceName = xpc_dictionary_get_string(request, wire::kSourceName);
   const char* targetPath = xpc_dictionary_get_string(request, wire::kTargetPath);
   const char* stableId = xpc_dictionary_get_string(request, wire::kTargetStableId);
@@ -206,7 +210,8 @@ core::RawWriteResult executeWrite(xpc_object_t request,
       *analysis.image, *found,
       static_cast<core::VerificationProfile>(verificationProfileValue),
       static_cast<std::size_t>(blockSize),
-      xpc_dictionary_get_bool(request, wire::kClearTargetTailMetadata));
+      xpc_dictionary_get_bool(request, wire::kClearTargetTailMetadata),
+      std::move(writeRanges));
   if (!planning.succeeded()) {
     result.error = planning.issues.empty() ? "The privileged write plan was rejected"
                                            : planning.issues.front().message;
@@ -221,8 +226,7 @@ core::RawWriteResult executeWrite(xpc_object_t request,
                        : std::move(openedSource.error);
     return result;
   }
-  result = macos::writeRawLocally(
-      *planning.plan, openedSource.source.get(),
+  const core::RawWriteProgressCallback onProgress =
       [peer, operation](const core::RawWriteProgress& progress) {
         xpc_object_t message = xpc_dictionary_create(nullptr, nullptr, 0);
         xpc_dictionary_set_int64(message, wire::kVersionKey, wire::kVersion);
@@ -233,15 +237,19 @@ core::RawWriteResult executeWrite(xpc_object_t request,
         xpc_dictionary_set_uint64(message, wire::kProcessed, progress.bytesProcessed);
         xpc_dictionary_set_uint64(message, wire::kTotal, progress.totalBytes);
         xpc_connection_send_message(peer, message);
-      },
-      [operation] { return operation->cancelled.load(); });
-
-  struct stat finalStat {};
-  if (fstat(source.get(), &finalStat) != 0 || !sameFile(descriptorStat, finalStat)) {
-    result.success = false;
-    result.error = "The source image changed during the write";
-  }
-  return result;
+      };
+  return rufus::backend::detail::finishNativeWrite(*planning.plan,
+      [&](const core::RawWriteProgressCallback& progress) {
+        return macos::writeRawLocally(*planning.plan, openedSource.source.get(), progress,
+            [operation] { return operation->cancelled.load(); });
+      }, [&](std::string& error) {
+        struct stat finalStat {};
+        if (fstat(source.get(), &finalStat) != 0 || !sameFile(descriptorStat, finalStat)) {
+          error = "The source image changed during the write";
+          return false;
+        }
+        return true;
+      }, onProgress);
 }
 
 core::BadBlockTestResult executeBadBlockTest(

@@ -1,0 +1,66 @@
+name: Native virtual-disk qualification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  virtual-disk:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install compression libraries and FAT checker (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libbz2-dev liblzma-dev libzstd-dev dosfstools
+
+      - name: Install compression libraries (macOS)
+        if: runner.os == 'macOS'
+        run: brew install bzip2 xz zstd
+
+      - name: Install compression libraries (Windows)
+        if: runner.os == 'Windows'
+        run: vcpkg install zlib:x64-windows-static-md bzip2:x64-windows-static-md liblzma:x64-windows-static-md zstd:x64-windows-static-md
+
+      - name: Configure (Linux and macOS)
+        if: runner.os != 'Windows'
+        run: >-
+          cmake -S . -B build/virtual-disk
+          -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+          -DRUFUSPP_BUILD_QT_APP=OFF -DRUFUSPP_BUILD_PLATFORM_BACKENDS=ON
+          -DRUFUSPP_STRICT_WARNINGS=ON -DRUFUSPP_RUN_VIRTUAL_DISK_TESTS=ON
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: >-
+          cmake -S . -B build/virtual-disk
+          -DBUILD_TESTING=ON
+          -DRUFUSPP_BUILD_QT_APP=OFF -DRUFUSPP_BUILD_PLATFORM_BACKENDS=ON
+          -DRUFUSPP_STRICT_WARNINGS=ON -DRUFUSPP_RUN_VIRTUAL_DISK_TESTS=ON
+          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=x64-windows-static-md
+
+      - name: Build native backends, helper, and tests
+        run: cmake --build build/virtual-disk --parallel 4 --config Debug
+
+      - name: Test without device privileges
+        run: ctest --test-dir build/virtual-disk -C Debug -LE virtual-disk --output-on-failure
+
+      - name: Test only newly created virtual images (Linux and macOS)
+        if: runner.os != 'Windows'
+        run: >-
+          sudo python3 -B tests/virtual_disk_integration.py
+          --helper build/virtual-disk/tests/rufus_plus_plus_virtual_disk_helper --require
+
+      - name: Test only newly created virtual images (Windows)
+        if: runner.os == 'Windows'
+        run: >-
+          python -B tests/virtual_disk_integration.py
+          --helper build/virtual-disk/tests/Debug/rufus_plus_plus_virtual_disk_helper.exe --require

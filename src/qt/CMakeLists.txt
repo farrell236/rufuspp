@@ -26,7 +26,19 @@ set_target_properties(rufus_plus_plus PROPERTIES
   WIN32_EXECUTABLE TRUE
 )
 
+if(UNIX)
+  rufuspp_bundle_ntfs_formatter(rufus_plus_plus)
+endif()
+
 if(APPLE)
+  add_custom_command(TARGET rufus_plus_plus POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+      "${PROJECT_SOURCE_DIR}/third_party/ntfs-3g"
+      "$<TARGET_BUNDLE_DIR:rufus_plus_plus>/Contents/Resources/third-party/ntfs-3g"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+      "${PROJECT_SOURCE_DIR}/third_party/windows-ntfs-boot"
+      "$<TARGET_BUNDLE_DIR:rufus_plus_plus>/Contents/Resources/third-party/windows-ntfs-boot"
+    VERBATIM)
   set_target_properties(rufus_plus_plus PROPERTIES
     MACOSX_BUNDLE_GUI_IDENTIFIER "${RUFUSPP_MACOS_APP_IDENTIFIER}"
   )
@@ -57,6 +69,9 @@ if(APPLE)
     if(RUFUSPP_MACOS_CODE_SIGN_IDENTITY)
       find_program(CODESIGN_EXECUTABLE codesign REQUIRED)
       add_custom_command(TARGET rufus_plus_plus POST_BUILD
+        COMMAND ${CODESIGN_EXECUTABLE} --force --options runtime --timestamp
+                --sign "${RUFUSPP_MACOS_CODE_SIGN_IDENTITY}"
+                "$<TARGET_FILE_DIR:rufus_plus_plus>/rufus-mkntfs"
         COMMAND ${CODESIGN_EXECUTABLE} --force --options runtime --timestamp
                 --identifier "${RUFUSPP_MACOS_HELPER_IDENTIFIER}"
                 --sign "${RUFUSPP_MACOS_CODE_SIGN_IDENTITY}"
@@ -96,6 +111,22 @@ install(TARGETS rufus_plus_plus
   RUNTIME DESTINATION bin
 )
 install(FILES "${PROJECT_SOURCE_DIR}/LICENSE.txt" DESTINATION .)
+if(UNIX AND NOT APPLE)
+  install(PROGRAMS "${RUFUSPP_NTFS_FORMATTER}" DESTINATION bin RENAME rufus-mkntfs)
+  set(ntfs_package_dir "share/rufusplusplus/third-party/ntfs-3g")
+  install(FILES
+    "${PROJECT_SOURCE_DIR}/third_party/ntfs-3g/README.md"
+    "${PROJECT_SOURCE_DIR}/third_party/ntfs-3g/COPYING"
+    "${PROJECT_SOURCE_DIR}/third_party/ntfs-3g/COPYING.LIB"
+    "${PROJECT_SOURCE_DIR}/third_party/ntfs-3g/CMakeLists.txt"
+    "${PROJECT_SOURCE_DIR}/third_party/ntfs-3g/ntfs-3g_ntfsprogs-2026.9.28.tgz"
+    DESTINATION "${ntfs_package_dir}")
+endif()
+
+if(NOT APPLE)
+  install(DIRECTORY "${PROJECT_SOURCE_DIR}/third_party/windows-ntfs-boot"
+    DESTINATION "share/rufusplusplus/third-party")
+endif()
 
 qt_generate_deploy_app_script(
   TARGET rufus_plus_plus
@@ -114,6 +145,16 @@ if(BUILD_TESTING)
   add_test(NAME qt-privilege-indicator
            COMMAND rufus_plus_plus --verify-privilege-indicator)
   set_tests_properties(qt-privilege-indicator PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    TIMEOUT 15
+  )
+  add_test(NAME qt-write-progress COMMAND rufus_plus_plus --verify-progress-display)
+  set_tests_properties(qt-write-progress PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    TIMEOUT 15
+  )
+  add_test(NAME qt-preflight-sizing COMMAND rufus_plus_plus --verify-preflight-sizing)
+  set_tests_properties(qt-preflight-sizing PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
     TIMEOUT 15
   )

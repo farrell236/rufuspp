@@ -87,7 +87,9 @@ SafetyCheckResult SafetyPolicy::validateWrite(const ImageInfo& image,
 SafetyCheckResult SafetyPolicy::validateIdentity(const BlockDeviceInfo& selected,
                                                  const BlockDeviceInfo& observed) const {
   SafetyCheckResult result;
-  const bool serialChanged = !selected.serialNumber.empty() && !observed.serialNumber.empty() &&
+  // Losing an identity field that was known at selection is also a mismatch.
+  // Do not accept a replacement observation with weaker identity evidence.
+  const bool serialChanged = !selected.serialNumber.empty() &&
                              selected.serialNumber != observed.serialNumber;
   if (selected.stableId.empty() || selected.stableId != observed.stableId ||
       selected.devicePath != observed.devicePath || selected.capacityBytes != observed.capacityBytes ||

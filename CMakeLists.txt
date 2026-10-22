@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 
 project(
   RufusPlusPlus
-  VERSION 0.1.0
+  VERSION 0.2.0
   DESCRIPTION "A cross-platform boot-media utility"
   LANGUAGES CXX
 )
@@ -69,6 +69,10 @@ option(RUFUSPP_STRICT_WARNINGS "Treat warnings in new cross-platform code as err
 add_subdirectory(src/portable)
 
 if(RUFUSPP_BUILD_PLATFORM_BACKENDS)
+  if(UNIX)
+    enable_language(C)
+    add_subdirectory(third_party/ntfs-3g)
+  endif()
   add_subdirectory(src/platform)
 endif()
 

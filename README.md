@@ -23,6 +23,7 @@ You will need:
 
 - CMake 3.24 or later
 - A C++17 compiler
+- A C compiler and `make` on macOS/Linux for the bundled NTFS components
 - Qt 6.5 or later with Widgets and Network
 - Development packages for zlib, libbz2, liblzma, and libzstd
 
@@ -47,6 +48,60 @@ cmake --preset core-only
 cmake --build --preset core-only
 ctest --preset core-only
 ```
+
+To run the writer tests after building:
+
+```console
+ctest --preset core-only -L writers --verbose
+```
+
+These tests exercise `RawImageWriter` with in-memory source and target transports,
+and `FileImageWriter` with isolated temporary files. They cover exact copying,
+verification profiles, trailing metadata clearing, source and target changes,
+injected I/O failures, cancellation, progress reporting, and temporary-file
+cleanup. They do not open physical devices or require elevated privileges.
+With Python 3 available, they also write real FAT16, FAT32, GPT and patterned
+images through native OS file I/O, close/reopen them, and independently compare
+every byte and SHA-256. The FAT fixtures include known file contents; macOS and
+Linux can additionally run read-only filesystem checks. These file-based tests
+need no root access. Run just this integration test with:
+
+```console
+ctest --preset core-only -R '^native-file-image-write$' --verbose
+```
+
+The cross-platform CI workflow runs these automated writer tests on Linux,
+Windows and macOS. Physical-device tests remain separate, opt-in operations.
+
+Standard Windows ISO staging on macOS/Linux bundles its NTFS library and
+private formatter; it does not require macFUSE or a host ntfs-3g installation.
+MBR Windows media supports BIOS and BIOS + UEFI, while GPT is UEFI-only.
+Standalone NTFS formatting and Windows To Go retain separate host dependencies.
+
+The latest local macOS build passes 25 CTest entries. Physical Kingston USB
+checks cover Ubuntu writing/persistence and Windows NTFS boot to Setup under
+QEMU UEFI and BIOS firmware. These results do not qualify other host backends,
+Secure Boot, actual PC firmware, or a complete Windows installation. See the
+[current qualification snapshot](docs/write-testing.md#current-qualification-snapshot).
+
+Native I/O fault tests, opt-in disposable virtual-disk integration, and the
+physical-device qualification procedure are documented in
+[Destructive-write validation](docs/write-testing.md). A skipped virtual-disk
+test is not evidence of a successful device write.
+
+An opt-in test also writes a checksum-verified official Ubuntu ARM64 ISO and
+checks the complete readback and boot-file contents. Its preparation, local
+runner and limits are described in the same validation document; it does not
+download multi-gigabyte fixtures during normal tests.
+
+For this host's qualified physical USB, a manual ARM64 QEMU launcher can capture
+the USB read-only, safely eject it, and boot the verified local copy as read-only
+virtual USB media. See [QEMU boot preparation](docs/write-testing.md#qemu-boot-preparation).
+
+An additional manual QEMU test creates persistent live media through the
+production ISO stager and writer, checks saved user data and configuration
+across independent VM boots, and runs a read-only Linux filesystem check. See
+[Live Linux persistence test](docs/write-testing.md#live-linux-persistence-test).
 
 The resulting Qt executable is placed under `build/dev/src/qt`. On macOS it is
 the `Rufus++.app` bundle.
@@ -86,6 +141,8 @@ See the platform documentation below for details.
 - [Features and runtime requirements](docs/features.md)
 - [Architecture, safety model, and platform backends](docs/cross-platform.md)
 - [Automated builds and releases](docs/releases.md)
+- [Changelog](CHANGELOG.md)
+- [Write tests and field qualification](docs/write-testing.md)
 
 ## License and attribution
 
@@ -100,4 +157,5 @@ at your option, any later version. See [LICENSE.txt](LICENSE.txt).
 
 Rufus and its original source code are copyright Pete Batard and contributors.
 New cross-platform code is copyright its respective contributors. Third-party
-assets retain their original licences and provenance under `res/`.
+assets retain their original licences and provenance under `res/` and
+`third_party/`. Bundled NTFS source and licensing accompany distribution packages.

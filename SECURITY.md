@@ -6,7 +6,12 @@ and Windows, and Windows also exposes FFU application through DISM. Every path
 revalidates the source and whole removable target before destructive I/O, but
 the transports have not completed removable-hardware fault testing.
 
-Unsigned macOS development builds keep START disabled. Signed builds delegate
+Ordinary unsigned macOS development builds keep physical writes disabled.
+The explicit `RUFUSPP_MACOS_UNSIGNED_ROOT_MODE` development variant omits the
+helper and allows guarded device operations only when the entire application
+is launched with an effective UID of zero. Its indicator reports UNPRIVILEGED
+or ELEVATED; this mode is for controlled hardware testing and is not a production
+privilege boundary. Signed builds delegate
 destructive I/O to a narrow `SMAppService` launch daemon that mutually
 authenticates the app, accepts an already-open source descriptor, and
 independently revalidates the target. Linux and Windows currently perform raw

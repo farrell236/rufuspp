@@ -11,6 +11,7 @@
 #pragma once
 
 #include <QMainWindow>
+#include <QElapsedTimer>
 
 #include <atomic>
 #include <cstdint>
@@ -48,6 +49,7 @@ struct WindowsToGoProgress;
 }
 
 namespace rufus::core {
+enum class IsoDeploymentFilesystem;
 class ImageAnalyzer;
 struct IsoDeploymentProgress;
 struct IsoDeploymentOptions;
@@ -64,6 +66,9 @@ namespace rufus::qt {
 
 class MainWindow final : public QMainWindow {
  Q_OBJECT
+
+  friend class ProgressDisplayProbe;
+  friend class PreflightSizingProbe;
 
  public:
   explicit MainWindow(QWidget* parent = nullptr);
@@ -96,6 +101,9 @@ class MainWindow final : public QMainWindow {
   void toggleLog();
 
  private:
+  static void configureIsoPreflightSizing(
+      core::DeploymentPreflightInput& input,
+      core::IsoDeploymentFilesystem fileSystem);
   void buildUi();
   [[nodiscard]] bool collectWindowsToGoOptions();
   [[nodiscard]] bool collectWindowsInstallationOptions();
@@ -126,6 +134,9 @@ class MainWindow final : public QMainWindow {
   void beginOperationGuard();
   void endOperationGuard();
   void noteOperationProgress();
+  void setOperationProgress(const QString& stage, std::uint64_t completed = 0,
+                            std::uint64_t total = 0);
+  void refreshOperationProgress();
   void fitWindowToContents();
   void scheduleWindowFitToContents();
   void saveDeploymentReceipt(const core::RawWriteResult& result);
@@ -161,6 +172,13 @@ class MainWindow final : public QMainWindow {
   QPushButton* startButton_{};
   QPushButton* closeButton_{};
   QProgressBar* progressBar_{};
+  QLabel* operationProgressLabel_{};
+  QTimer* progressRefreshTimer_{};
+  QElapsedTimer operationElapsed_;
+  qint64 progressElapsedMs_{};
+  QString progressStage_;
+  std::uint64_t progressCompleted_{};
+  std::uint64_t progressTotal_{};
   QTextEdit* logView_{};
   QLabel* privilegeLabel_{};
   std::unique_ptr<backend::BlockDeviceBackend> deviceBackend_;

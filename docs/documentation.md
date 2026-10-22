@@ -18,6 +18,9 @@ may differ by host, installed dependencies, detected image, target geometry,
 and Windows version. Native styling also varies slightly between operating
 systems.
 
+These instructions describe Rufus++ 0.2.0. See the [release notes](release-notes/0.2.0.md)
+for changes and the [release workflow](releases.md) for package details.
+
 ## Contents
 
 - [Install or build Rufus++](#install-or-build-rufus)
@@ -59,6 +62,8 @@ usual macOS override for an unsigned application.
 
 Install CMake 3.24 or later, a C++17 compiler, Qt 6.5 or later with Widgets and
 Network, and the development packages for zlib, libbz2, liblzma, and libzstd.
+macOS/Linux builds also need a C compiler and `make` for the bundled NTFS library
+and private formatter; they do not install a host filesystem driver.
 From the repository root, run:
 
 ```console
@@ -167,7 +172,7 @@ them for inspection, but protected devices remain ineligible for writing.
 | **Volume label** | Sets the new filesystem label where the selected deployment mode owns the filesystem. |
 | **File system** | Selects FAT32 or NTFS for compatible ISO workflows. Raw images use their image-defined layout. |
 | **Cluster size** | Selects a validated allocation unit or lets Rufus++ choose automatically. |
-| **Quick format** | Keeps otherwise-unused target sectors intact where supported. Clear it to overwrite and verify unused space too. |
+| **Quick format** | FAT32 ISO mode, including persistence, and NTFS ISO mode on macOS/Linux write initialized data and required metadata while skipping unallocated regions. Windows NTFS commits a dense image. Clear Quick format for full overwrite. |
 | **Post-write verification** | Chooses sampled, written-data, or complete-device verification. |
 | **Validate UEFI media at boot** | Wraps supported UEFI fallback loaders with the bundled offline validator and writes a complete MD5 manifest. |
 | **Check device for bad blocks** | Runs one to four destructive address-dependent write/read passes before deployment. |
@@ -175,7 +180,10 @@ them for inspection, but protected devices remain ineligible for writing.
 ### Status and toolbar
 
 The progress bar reports source analysis, staging, writing, verification, and
-completion. During a cancellable operation, **CLOSE** becomes **CANCEL**.
+completion. During media creation, a separate readout beneath the bar shows
+the current stage, its percentage and bytes processed, plus elapsed time.
+This text remains visible with native macOS progress bars. During a cancellable
+operation, **CLOSE** becomes **CANCEL**.
 
 The lower-left toolbar is ordered as follows:
 
@@ -224,9 +232,17 @@ size, format policy, and verification profile.
 
 FAT32 deployment works across all hosts. If `install.wim` or `install.esd` is
 too large for FAT32, Rufus++ uses wimlib to create validated split WIM parts.
-Alternatively, an available NTFS staging provider can create an NTFS data
-partition plus the bundled UEFI:NTFS helper partition. Missing dependencies
-keep the operation disabled and appear in Capability Health.
+Use NTFS to keep the original installation files, including files over 4 GiB.
+On macOS/Linux, standard NTFS ISO mode uses the application's bundled library
+and formatter; macFUSE, host ntfs-3g tools and filesystem mounts are unnecessary.
+Windows uses native DiskPart. This does not change the separate Windows To Go
+or standalone-formatting dependencies.
+
+For x86/x64 Windows installers on 512-byte-sector targets, choose **MBR + BIOS**
+or **MBR + BIOS/UEFI** for legacy boot support. BIOS + UEFI installs both Windows
+BOOTMGR boot code and the UEFI:NTFS helper. **GPT + UEFI** installs the UEFI
+helper; GPT is not a legacy BIOS layout. Missing required components appear in
+Capability Health and keep the operation disabled.
 
 Select the settings button beside **Image option** to open Windows User
 Experience options:
@@ -287,6 +303,10 @@ The slider is disabled or has no usable range when either condition is absent.
 A value of zero creates ordinary live media. A nonzero value adds a verified
 ext2 `casper-rw` partition for Ubuntu/Casper or a Debian `persistence`
 partition with `/persistence.conf`, and patches only recognized boot entries.
+MBR and GPT persistence layouts are supported when compatible with the chosen
+firmware. Casper media includes a shutdown hook to finalize its backing
+filesystem. Shut the live system down normally before unplugging the USB so
+saved files and settings can be flushed.
 
 Unknown or distribution-specific layouts are intentionally not guessed.
 Tails, for example, keeps its native encrypted persistence workflow.
@@ -343,8 +363,11 @@ sets UEFI and disables the target-system control until MBR is selected again.
 
 ### Filesystem and cluster size
 
-FAT32 is the portable default for compatible ISO deployment. NTFS is used when
-the content requires it and a complete UEFI:NTFS provider is available.
+FAT32 is the portable default for compatible ISO deployment. NTFS can be
+selected explicitly or used for content requiring large-file support. Standard
+NTFS ISO creation uses bundled components on macOS/Linux and DiskPart on Windows;
+UEFI targets include UEFI:NTFS, while supported Windows MBR targets also offer BIOS
+boot code.
 Cluster-size entries are filtered and validated against the filesystem and the
 target's logical sector size. **Automatic (Default)** is appropriate unless a
 specific compatibility requirement calls for another allocation unit.
@@ -352,7 +375,10 @@ specific compatibility requirement calls for another allocation unit.
 ### Quick versus full format
 
 Quick format writes the structures and source payload required by the selected
-operation. Full format additionally overwrites and verifies otherwise-unused
+operation. FAT32 ISO creation on all hosts and NTFS ISO creation on macOS/Linux
+skip unallocated regions while including required zero metadata and backup
+structures. Windows NTFS uses a quick filesystem format but currently copies the
+whole staged image to the target. Full format overwrites and verifies otherwise-unused
 target space. It is substantially slower and causes additional flash wear, but
 is useful when qualifying suspect media or clearing stale content. Raw and FFU
 deployment always follow the image-defined coverage.
@@ -492,6 +518,8 @@ Expand **Show Details** and verify:
 - stable target identity and capacity;
 - partition scheme, firmware target, filesystem, and cluster size;
 - quick/full policy and verification profile;
+- write size and temporary-space budget; quick-write size may read
+  **Calculated during preparation** until the initialized ranges are known;
 - content transformations such as WIM splitting or Linux persistence;
 - required providers and their availability;
 - warnings and blockers.
@@ -499,7 +527,20 @@ Expand **Show Details** and verify:
 **Cancel** is the default. A plan with a blocker cannot reach this confirmation.
 
 During an operation, the progress bar distinguishes staging, writing, clearing
-old metadata, verification, and completion. **CANCEL** requests a safe stop;
+old metadata, verification, and completion. The text readout's byte count and
+percentage apply to the current stage; verification starts its own counter.
+For quick FAT32 ISO creation and quick NTFS ISO creation on macOS/Linux, the
+write total counts initialized data and metadata being transferred. The reserved
+persistence size and USB capacity are separate from that total. Preflight defers
+the exact write size until preparation calculates it; Windows NTFS's dense
+commit retains its known whole-image total. NTFS temporary-space preflight and
+the backend use the same calculation, including both staging files on macOS/Linux.
+
+![Current-stage percentage, bytes and elapsed time](assets/write-progress.png)
+
+Elapsed time covers the whole operation and continues updating during flushing
+or other stages without byte counts. A running timer alone does not establish
+that device I/O is advancing. **CANCEL** requests a safe stop;
 the current operating-system I/O call may need to return first. If destructive
 writing has already started, a cancelled or failed target may contain a partial
 image and must not be trusted or booted.
@@ -563,9 +604,15 @@ control introduced for Windows 11 is intentionally hidden for Vista, Windows
 
 ### NTFS or a host filesystem is absent
 
-Rufus++ lists dependency-gated filesystems only when their complete provider is
-available. Install the tools listed in [Features and runtime
-requirements](features.md), restart Rufus++, and check Capability Health again.
+For standard Windows NTFS ISO creation on macOS/Linux, check that the package
+contains its private `rufus-mkntfs` beside the executable (inside the app bundle
+on macOS). Rebuild or reinstall a complete Rufus++ package if it is missing;
+installing macFUSE or host ntfs-3g is not required for this workflow. Windows uses
+its built-in DiskPart provider.
+
+Standalone NTFS formatting, Windows To Go and other host filesystems retain
+separate providers. Use [Features and runtime requirements](features.md) for
+those dependencies, then check Capability Health again.
 
 ### Virtual boot testing is unavailable
 
@@ -592,7 +639,10 @@ activity indicator is active.
   least-privilege helpers.
 - Full Authenticode trust-chain validation, certificate-based DBX matching, and
   Windows SVN analysis are not implemented.
-- QEMU testing is a bounded launch smoke test, not a hardware boot test.
+- The built-in Virtual boot test is a bounded launch smoke test. Separate
+  physical-USB tests reached Windows Setup under UEFI and BIOS QEMU firmware;
+  actual-machine firmware, Secure Boot and a complete Windows installation
+  remain untested. See [write-testing.md](write-testing.md).
 - Differencing VHD chains, VHDX images with active logs, uncommon UDF layouts,
   and unknown Linux persistence or legacy Syslinux-only BIOS layouts are
   deliberately restricted instead of guessed.

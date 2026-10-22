@@ -17,6 +17,8 @@
 
 #include "rufus/backend/block_device_backend.hpp"
 #include "rufus/core/image_analyzer.hpp"
+#include "system_raw_io.hpp"
+#include "raw_write_safety.hpp"
 
 #include <algorithm>
 #include <array>
@@ -241,105 +243,8 @@ std::optional<DWORD> physicalDriveNumber(const std::string_view path) {
   return result;
 }
 
-bool setFileOffset(const HANDLE handle, const std::uint64_t offset,
-                   std::string& error) {
-  if (offset > static_cast<std::uint64_t>(std::numeric_limits<LONGLONG>::max())) {
-    error = "Raw I/O offset exceeds the Windows file-offset limit";
-    return false;
-  }
-  LARGE_INTEGER position{};
-  position.QuadPart = static_cast<LONGLONG>(offset);
-  if (!SetFilePointerEx(handle, position, nullptr, FILE_BEGIN)) {
-    error = errorMessage("Unable to seek in the raw source or target");
-    return false;
-  }
-  return true;
-}
-
-bool positionalRead(const HANDLE handle, const std::uint64_t offset,
-                    unsigned char* data, const std::size_t size,
-                    std::string& error) {
-  if (!setFileOffset(handle, offset, error)) {
-    return false;
-  }
-  std::size_t completed = 0;
-  while (completed < size) {
-    const DWORD requested = static_cast<DWORD>(std::min<std::size_t>(
-        size - completed, static_cast<std::size_t>(std::numeric_limits<DWORD>::max())));
-    DWORD count = 0;
-    if (!ReadFile(handle, data + completed, requested, &count, nullptr)) {
-      error = errorMessage("Raw read failed");
-      return false;
-    }
-    if (count == 0) {
-      error = "Unexpected end of the raw source or target";
-      return false;
-    }
-    completed += count;
-  }
-  return true;
-}
-
-bool positionalWrite(const HANDLE handle, const std::uint64_t offset,
-                     const unsigned char* data, const std::size_t size,
-                     std::string& error) {
-  if (!setFileOffset(handle, offset, error)) {
-    return false;
-  }
-  std::size_t completed = 0;
-  while (completed < size) {
-    const DWORD requested = static_cast<DWORD>(std::min<std::size_t>(
-        size - completed, static_cast<std::size_t>(std::numeric_limits<DWORD>::max())));
-    DWORD count = 0;
-    if (!WriteFile(handle, data + completed, requested, &count, nullptr)) {
-      error = errorMessage("Raw write failed");
-      return false;
-    }
-    if (count == 0) {
-      error = "The raw target accepted a zero-length write";
-      return false;
-    }
-    completed += count;
-  }
-  return true;
-}
-
-class WindowsRawTarget final : public core::RawTargetIo {
- public:
-  WindowsRawTarget(const HANDLE handle, const std::uint64_t capacity,
-                   const std::uint32_t sectorSize)
-      : handle_(handle), capacity_(capacity), sectorSize_(sectorSize) {}
-
-  [[nodiscard]] std::uint64_t capacityBytes() const noexcept override {
-    return capacity_;
-  }
-  [[nodiscard]] std::uint32_t logicalSectorSize() const noexcept override {
-    return sectorSize_;
-  }
-
-  bool writeAt(const std::uint64_t offset, const unsigned char* data,
-               const std::size_t size, std::string& error) override {
-    return positionalWrite(handle_, offset, data, size, error);
-  }
-
-  bool readAt(const std::uint64_t offset, unsigned char* data,
-              const std::size_t size, std::string& error) override {
-    return positionalRead(handle_, offset, data, size, error);
-  }
-
-  bool flush(std::string& error) override {
-    if (!FlushFileBuffers(handle_)) {
-      error = errorMessage("Unable to flush the target device");
-      return false;
-    }
-    return true;
-  }
-
- private:
-  HANDLE handle_;
-  std::uint64_t capacity_;
-  std::uint32_t sectorSize_;
-};
+using detail::positionalRead;
+using WindowsRawTarget = detail::SystemRawTarget;
 
 class WindowsRawSource final : public core::RawSourceIo {
  public:
@@ -1715,12 +1620,9 @@ core::RawWriteResult WindowsBlockDeviceBackend::writeRaw(
     result.error = "The selected target is no longer connected";
     return result;
   }
-  const core::SafetyPolicy safetyPolicy;
-  const auto identity = safetyPolicy.validateIdentity(plan.target(), *observed);
-  const auto writeSafety = safetyPolicy.validateWrite(plan.image(), *observed);
-  if (!identity.safe() || !writeSafety.safe()) {
-    result.error = !identity.safe() ? identity.issues.front().message
-                                    : writeSafety.issues.front().message;
+  const auto targetSafety = detail::validateRawWriteTarget(plan, *observed);
+  if (!targetSafety.safe()) {
+    result.error = targetSafety.issues.front().message;
     return result;
   }
 
@@ -1750,7 +1652,7 @@ core::RawWriteResult WindowsBlockDeviceBackend::writeRaw(
     result.error = "The target disappeared after its volumes were dismounted";
     return result;
   }
-  const auto finalIdentity = safetyPolicy.validateIdentity(plan.target(), *reobserved);
+  const auto finalIdentity = detail::validateRawWriteTarget(plan, *reobserved);
   if (!finalIdentity.safe()) {
     result.error = finalIdentity.issues.front().message;
     return result;
@@ -1796,23 +1698,23 @@ core::RawWriteResult WindowsBlockDeviceBackend::writeRaw(
   WindowsRawTarget target(targetHandle.get(), geometry->capacity,
                           geometry->sectorSize);
   const core::RawImageWriter writer;
-  result = writer.write(plan, *openedSource.source, target, onProgress,
-                        isCancelled);
-  if (result.success) {
-    const auto finalSourceSafety = core::WritePlanBuilder::validateSource(plan);
-    if (!finalSourceSafety.safe()) {
-      result.success = false;
-      result.error = finalSourceSafety.issues.front().message;
-    }
-  }
-  if (result.success &&
-      !DeviceIoControl(targetHandle.get(), IOCTL_DISK_UPDATE_PROPERTIES, nullptr,
-                       0, nullptr, 0, &returned, nullptr)) {
-    result.success = false;
-    result.error = errorMessage(
-        "The image was written and verified, but Windows could not refresh the disk layout");
-  }
-  return result;
+  return detail::finishNativeWrite(plan,
+      [&](const auto& progress) {
+        return writer.write(plan, *openedSource.source, target, progress, isCancelled);
+      }, [&](std::string& error) {
+        const auto safety = core::WritePlanBuilder::validateSource(plan);
+        if (!safety.safe()) {
+          error = safety.issues.front().message;
+          return false;
+        }
+        if (!DeviceIoControl(targetHandle.get(), IOCTL_DISK_UPDATE_PROPERTIES, nullptr,
+                             0, nullptr, 0, &returned, nullptr)) {
+          error = errorMessage(
+              "The image was written and verified, but Windows could not refresh the disk layout");
+          return false;
+        }
+        return true;
+      }, onProgress);
 }
 
 }  // namespace

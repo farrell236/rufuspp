@@ -29,6 +29,9 @@
 #include <vector>
 
 #include "rufus/core/wim_applier.hpp"
+#include "ntfs_iso_format.hpp"
+#include "ntfs_bootstrap.hpp"
+#include "../../portable/src/windows_boot_code.hpp"
 #include "uefi_ntfs_bootstrap_data.hpp"
 
 #if defined(_WIN32)
@@ -41,6 +44,7 @@
 #include <winioctl.h>
 #include <process.h>
 #else
+#include "ntfs_file_tree.hpp"
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/types.h>
@@ -51,8 +55,8 @@
 namespace rufus::backend {
 namespace {
 
-constexpr std::uint64_t kSectorSize = 512;
-constexpr std::uint64_t kPartitionAlignmentSectors = 2048;
+constexpr std::uint64_t kSectorSize = detail::kNtfsIsoSectorSize;
+constexpr std::uint64_t kPartitionAlignmentSectors = detail::kNtfsIsoFirstSector;
 constexpr std::uint64_t kEspSectors = 260ULL * 1024ULL * 1024ULL / kSectorSize;
 constexpr std::uint64_t kMsrSectors = 16ULL * 1024ULL * 1024ULL / kSectorSize;
 constexpr std::size_t kGptEntryCount = 128;
@@ -201,6 +205,7 @@ bool decodeUefiNtfsImage(std::vector<unsigned char>& decoded,
 
 bool createNtfsMbrImage(const std::filesystem::path& path,
                         const std::uint64_t capacityBytes,
+                        const core::IsoTargetSystem targetSystem,
                         std::string& error) {
   if (capacityBytes % kSectorSize != 0U) {
     error = "The NTFS staging capacity is not aligned to 512-byte sectors";
@@ -208,7 +213,10 @@ bool createNtfsMbrImage(const std::filesystem::path& path,
   }
   const std::uint64_t sectorCount = capacityBytes / kSectorSize;
   const std::uint64_t firstDataSector = kPartitionAlignmentSectors;
-  const std::uint64_t bootSectors = kUefiNtfsPartitionBytes / kSectorSize;
+  const bool bios = targetSystem == core::IsoTargetSystem::Bios ||
+                    targetSystem == core::IsoTargetSystem::BiosAndUefi;
+  const bool uefi = targetSystem != core::IsoTargetSystem::Bios;
+  const std::uint64_t bootSectors = uefi ? kUefiNtfsPartitionBytes / kSectorSize : 0U;
   const std::uint64_t tailSectors = kTargetTailReserveBytes / kSectorSize;
   if (sectorCount <= firstDataSector + bootSectors + tailSectors ||
       sectorCount > std::numeric_limits<std::uint32_t>::max()) {
@@ -223,19 +231,41 @@ bool createNtfsMbrImage(const std::filesystem::path& path,
   }
 
   std::vector<unsigned char> uefiNtfs;
-  if (!decodeUefiNtfsImage(uefiNtfs, error)) {
+  if (uefi && !decodeUefiNtfsImage(uefiNtfs, error)) {
     return false;
   }
   std::array<unsigned char, kSectorSize> mbr{};
+  if (bios) {
+    std::copy(core::detail::kWindowsMbrBootstrap.begin(),
+              core::detail::kWindowsMbrBootstrap.end(), mbr.begin());
+  }
+  std::random_device random;
+  put32(mbr.data() + 440U, static_cast<std::uint32_t>(random()) | 1U);
+  const auto chs = [](unsigned char* destination, const std::uint64_t lba) {
+    const auto cylinder = lba / (255U * 63U);
+    if (cylinder > 1023U) {
+      destination[0] = 0xfeU; destination[1] = 0xffU; destination[2] = 0xffU;
+    } else {
+      destination[0] = static_cast<unsigned char>((lba / 63U) % 255U);
+      destination[1] = static_cast<unsigned char>((lba % 63U + 1U) | ((cylinder >> 2U) & 0xc0U));
+      destination[2] = static_cast<unsigned char>(cylinder);
+    }
+  };
   unsigned char* const ntfs = mbr.data() + 446U;
   ntfs[0] = 0x80U;
+  chs(ntfs + 1U, firstDataSector);
   ntfs[4] = 0x07U;
+  chs(ntfs + 5U, bootFirst - 1U);
   put32(ntfs + 8U, static_cast<std::uint32_t>(firstDataSector));
   put32(ntfs + 12U, static_cast<std::uint32_t>(ntfsSectors));
-  unsigned char* const boot = mbr.data() + 462U;
-  boot[4] = 0xefU;
-  put32(boot + 8U, static_cast<std::uint32_t>(bootFirst));
-  put32(boot + 12U, static_cast<std::uint32_t>(bootSectors));
+  if (uefi) {
+    unsigned char* const boot = mbr.data() + 462U;
+    chs(boot + 1U, bootFirst);
+    boot[4] = 0xefU;
+    chs(boot + 5U, bootFirst + bootSectors - 1U);
+    put32(boot + 8U, static_cast<std::uint32_t>(bootFirst));
+    put32(boot + 12U, static_cast<std::uint32_t>(bootSectors));
+  }
   mbr[510] = 0x55U;
   mbr[511] = 0xaaU;
 
@@ -251,9 +281,11 @@ bool createNtfsMbrImage(const std::filesystem::path& path,
   std::fstream output(path, std::ios::binary | std::ios::in | std::ios::out);
   output.write(reinterpret_cast<const char*>(mbr.data()),
                static_cast<std::streamsize>(mbr.size()));
-  output.seekp(static_cast<std::streamoff>(bootFirst * kSectorSize));
-  output.write(reinterpret_cast<const char*>(uefiNtfs.data()),
-               static_cast<std::streamsize>(uefiNtfs.size()));
+  if (uefi) {
+    output.seekp(static_cast<std::streamoff>(bootFirst * kSectorSize));
+    output.write(reinterpret_cast<const char*>(uefiNtfs.data()),
+                 static_cast<std::streamsize>(uefiNtfs.size()));
+  }
   output.flush();
   if (!output) {
     error = "Unable to write the MBR/UEFI:NTFS staging layout";
@@ -299,20 +331,14 @@ bool validateNtfsStagingSpace(const core::IsoDeploymentPlan& plan,
             fileError.message();
     return false;
   }
-  const std::uint64_t extracted = plan.image().expandedSizeBytes;
-  if (extracted >
-      (std::numeric_limits<std::uint64_t>::max() - 9U) / 11U) {
-    error = "The NTFS staging space requirement overflowed";
+  const auto requirements = estimateNtfsIsoStagingRequirements(
+      plan.image().expandedSizeBytes, plan.target().capacityBytes,
+      plan.quickFormat());
+  if (!requirements.success) {
+    error = requirements.error;
     return false;
   }
-  const std::uint64_t allowance = (extracted * 11U + 9U) / 10U;
-  if (allowance > std::numeric_limits<std::uint64_t>::max() -
-                      kNtfsStagingReserveBytes) {
-    error = "The NTFS staging space requirement overflowed";
-    return false;
-  }
-  const std::uint64_t required = allowance + kNtfsStagingReserveBytes;
-  if (space.available < required) {
+  if (space.available < requirements.temporaryBytes) {
     error = "Not enough temporary disk space to stage the extracted NTFS ISO";
     return false;
   }
@@ -557,10 +583,16 @@ bool createNtfsGptImage(const std::filesystem::path& path,
 bool createNtfsIsoLayoutImage(const std::filesystem::path& path,
                               const std::uint64_t capacityBytes,
                               const core::PartitionScheme partitionScheme,
+                              const core::IsoTargetSystem targetSystem,
                               std::string& error) {
+  if (targetSystem == core::IsoTargetSystem::Automatic ||
+      (partitionScheme == core::PartitionScheme::Gpt && targetSystem != core::IsoTargetSystem::Uefi)) {
+    error = "NTFS BIOS boot requires MBR; a concrete target system is required";
+    return false;
+  }
   return partitionScheme == core::PartitionScheme::Gpt
              ? createNtfsGptImage(path, capacityBytes, error)
-             : createNtfsMbrImage(path, capacityBytes, error);
+             : createNtfsMbrImage(path, capacityBytes, targetSystem, error);
 }
 
 bool validateStagingSpace(const core::WindowsToGoPlan& plan,
@@ -1166,32 +1198,10 @@ class PosixWindowsToGoImageStager final : public WindowsToGoImageStager {
 class PosixNtfsIsoImageStager final : public NtfsIsoImageStager {
  public:
   [[nodiscard]] NtfsIsoAvailability availability() const override {
-#if !defined(__APPLE__)
-    if (geteuid() != 0) {
-      return {false,
-              "NTFS ISO staging requires the Linux application to run as administrator"};
-    }
-#endif
-    const std::vector<std::string> required{
-#if defined(__APPLE__)
-        "hdiutil", "mkntfs", "ntfs-3g", "umount"
-#else
-        "losetup", "mkntfs", "ntfs-3g", "umount"
-#endif
-    };
-    std::string missing;
-    for (const auto& tool : required) {
-      if (findExecutable(tool).empty()) {
-        if (!missing.empty()) {
-          missing += ", ";
-        }
-        missing += tool;
-      }
-    }
-    return missing.empty()
-               ? NtfsIsoAvailability{true, {}}
-               : NtfsIsoAvailability{
-                     false, "NTFS ISO host tools are missing: " + missing};
+    const auto formatter = detail::bundledNtfsFormatter();
+    return formatter.empty()
+               ? NtfsIsoAvailability{false, "The bundled NTFS formatter is missing from this application"}
+               : NtfsIsoAvailability{true, {}};
   }
 
   [[nodiscard]] core::IsoDeploymentResult stage(
@@ -1245,126 +1255,146 @@ class PosixNtfsIsoImageStager final : public NtfsIsoImageStager {
                      fileError.message();
       return result;
     }
-    const auto mountPath = workPath / "files";
-    std::filesystem::create_directory(mountPath, fileError);
-    if (fileError) {
-      result.error = "Unable to create the NTFS mount directory: " +
-                     fileError.message();
-      return result;
-    }
     if (onProgress) {
       onProgress({core::IsoDeploymentStage::Formatting, 0, 0,
-                  "Creating MBR, NTFS, and UEFI:NTFS partitions"});
+                  plan.targetSystem() == core::IsoTargetSystem::Bios
+                      ? "Creating NTFS partition for Windows BIOS boot"
+                      : "Creating NTFS and UEFI:NTFS partitions"});
     }
     if (!createNtfsIsoLayoutImage(outputPath, plan.target().capacityBytes,
-                                  plan.partitionScheme(), result.error)) {
+                                  plan.partitionScheme(), plan.targetSystem(), result.error)) {
       return result;
     }
-
-    std::string disk;
-    std::string ntfsDevice;
-    bool mounted = false;
-    const auto cleanupDevices = [&] {
-      bool succeeded = true;
-      if (mounted) {
-        const auto unmount = runCommand({"umount", mountPath.string()});
-        succeeded = unmount.exitCode == 0;
-        mounted = unmount.exitCode != 0;
+    // Derive the extent from the authored table rather than duplicating its
+    // MBR/GPT arithmetic in the formatter and copy path.
+    std::ifstream layout(outputPath, std::ios::binary);
+    const bool gpt = plan.partitionScheme() == core::PartitionScheme::Gpt;
+    std::array<unsigned char, 16> extent{};
+    layout.seekg(gpt ? 2U * kSectorSize + 32U : 446U + 8U);
+    layout.read(reinterpret_cast<char*>(extent.data()), gpt ? 16 : 8);
+    const auto le = [&](const std::size_t offset, const std::size_t bytes) {
+      std::uint64_t value = 0;
+      for (std::size_t index = 0; index < bytes; ++index) {
+        value |= static_cast<std::uint64_t>(extent[offset + index]) << (8U * index);
       }
-      if (!disk.empty() && !mounted) {
-#if defined(__APPLE__)
-        const auto detach = runCommand({"hdiutil", "detach", disk});
-#else
-        const auto detach = runCommand({"losetup", "-d", disk});
-#endif
-        succeeded = detach.exitCode == 0 && succeeded;
-        if (detach.exitCode == 0) {
-          disk.clear();
-        }
-      }
-      return succeeded && disk.empty() && !mounted;
+      return value;
     };
-#if defined(__APPLE__)
-    CommandResult attach = runCommand(
-        {"hdiutil", "attach", "-nomount", "-noverify", outputPath.string()},
-        isCancelled);
-    if (attach.exitCode != 0) {
-      result.cancelled = attach.cancelled;
-      result.error = commandFailure("Attaching the NTFS staging image", attach);
+    const auto first = le(0, gpt ? 8 : 4);
+    const auto sectors = gpt ? le(8, 8) - first + 1U : le(4, 4);
+    if (!layout || first != kPartitionAlignmentSectors || sectors == 0 ||
+        sectors > plan.target().capacityBytes / kSectorSize - first) {
+      result.error = "Invalid NTFS partition extent in the staging layout";
       return result;
     }
-    const std::size_t deviceStart = attach.output.find("/dev/disk");
-    const std::size_t deviceEnd =
-        attach.output.find_first_of(" \t\r\n", deviceStart);
-    if (deviceStart == std::string::npos) {
-      result.error = "hdiutil did not return an NTFS staging disk device";
+    layout.close();
+    const auto partitionOffset = first * kSectorSize;
+    const auto partitionBytes = sectors * kSectorSize;
+    const auto partitionPath = workPath / "filesystem.ntfs";
+    const int partitionFile = open(partitionPath.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (partitionFile < 0) {
+      result.error = "Unable to create the private NTFS partition file";
       return result;
     }
-    disk = attach.output.substr(deviceStart, deviceEnd - deviceStart);
-    ntfsDevice = disk + "s1";
-    const std::string rawNtfs = "/dev/r" + ntfsDevice.substr(5);
-#else
-    CommandResult attach = runCommand(
-        {"losetup", "--find", "--show", "--partscan", outputPath.string()},
-        isCancelled);
-    if (attach.exitCode != 0) {
-      result.cancelled = attach.cancelled;
-      result.error = commandFailure("Attaching the NTFS staging image", attach);
+    const int sized = ftruncate(partitionFile, static_cast<off_t>(partitionBytes));
+    const int closed = close(partitionFile);
+    if (sized != 0 || closed != 0) {
+      result.error = "Unable to size the private NTFS partition file";
       return result;
     }
-    disk = trim(attach.output);
-    if (disk.empty() || disk.rfind("/dev/loop", 0) != 0) {
-      result.error = "losetup did not return an NTFS staging loop device";
-      cleanupDevices();
-      return result;
-    }
-    ntfsDevice = disk + "p1";
-    for (unsigned int attempt = 0;
-         attempt < 50 && !std::filesystem::exists(ntfsDevice); ++attempt) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-    const std::string& rawNtfs = ntfsDevice;
-#endif
-    std::vector<std::string> formatCommand{"mkntfs", "-F"};
-    if (plan.quickFormat()) {
-      formatCommand.push_back("-Q");
-    }
-    if (plan.clusterSizeBytes() != 0U) {
-      formatCommand.insert(
-          formatCommand.end(),
-          {"-c", std::to_string(plan.clusterSizeBytes())});
-    }
-    formatCommand.insert(
-        formatCommand.end(),
-        {"-L", normalizedNtfsLabel(plan.volumeLabel()), rawNtfs});
-    CommandResult formatted = runCommand(formatCommand, isCancelled);
+    const auto formatCommand = detail::ntfsIsoFormatCommand(
+        partitionPath.string(), plan.quickFormat(), plan.clusterSizeBytes(),
+        normalizedNtfsLabel(plan.volumeLabel()), detail::bundledNtfsFormatter().string());
+    const auto formatted = runCommand(formatCommand, isCancelled);
     if (formatted.exitCode != 0) {
       result.cancelled = formatted.cancelled;
-      result.error = commandFailure("Formatting the NTFS ISO partition", formatted);
-      cleanupDevices();
+      result.error = commandFailure("Formatting the NTFS staging file", formatted);
       return result;
     }
-    CommandResult mount = runCommand(
-        {"ntfs-3g", ntfsDevice, mountPath.string(), "-o", "windows_names"},
-        isCancelled);
-    mounted = mount.exitCode == 0;
-    if (!mounted) {
-      result.cancelled = mount.cancelled;
-      result.error = commandFailure("Mounting the NTFS ISO partition", mount);
-      cleanupDevices();
+    auto tree = detail::NtfsFileTree::open(partitionPath, result.error);
+    if (!tree) return result;
+    // The extractor streams from the ISO into libntfs-3g and reopens the
+    // filesystem read-only before byte-comparing every file with its source.
+    const auto extractingProgress = [&](const core::IsoDeploymentProgress& progress) {
+      if (onProgress && progress.stage != core::IsoDeploymentStage::Complete) onProgress(progress);
+    };
+    result = core::IsoImageStager{}.extractToFileTree(plan, *tree, extractingProgress, isCancelled);
+    if (!result.success) return result;
+    result.success = false;
+    std::vector<core::RawWriteRange> partitionRanges;
+    if (!tree->allocatedRanges(partitionRanges, partitionBytes, result.error) ||
+        !tree->close(result.error)) return result;
+    tree.reset();
+    if (plan.legacyBiosBootstrap() == core::LegacyBiosBootstrap::WindowsBootManager &&
+        !detail::installWindowsNtfsBootstrap(partitionPath, 0, partitionBytes, result.error)) return result;
+    if (!plan.quickFormat()) partitionRanges = {{0, partitionBytes}};
+
+    std::ifstream input(partitionPath, std::ios::binary);
+    std::fstream assembled(outputPath, std::ios::binary | std::ios::in | std::ios::out);
+    std::vector<unsigned char> expected(1024U * 1024U);
+    std::vector<unsigned char> observed(expected.size());
+    std::uint64_t total = 0;
+    for (const auto& range : partitionRanges) {
+      if (range.offsetBytes > partitionBytes || range.sizeBytes > partitionBytes - range.offsetBytes) {
+        result.error = "NTFS allocation range exceeds the staging partition";
+        return result;
+      }
+      total += range.sizeBytes;
+    }
+    std::uint64_t copied = 0;
+    for (const auto& range : partitionRanges) {
+      std::uint64_t offset = 0;
+      while (offset < range.sizeBytes) {
+        if (isCancelled && isCancelled()) {
+          result.cancelled = true;
+          result.error = "NTFS staging cancelled while assembling the image";
+          return result;
+        }
+        const auto amount = static_cast<std::size_t>(std::min<std::uint64_t>(
+            expected.size(), range.sizeBytes - offset));
+        const auto sourceOffset = range.offsetBytes + offset;
+        const auto destinationOffset = partitionOffset + sourceOffset;
+        input.seekg(static_cast<std::streamoff>(sourceOffset));
+        input.read(reinterpret_cast<char*>(expected.data()), static_cast<std::streamsize>(amount));
+        assembled.seekp(static_cast<std::streamoff>(destinationOffset));
+        assembled.write(reinterpret_cast<const char*>(expected.data()), static_cast<std::streamsize>(amount));
+        assembled.flush();
+        assembled.seekg(static_cast<std::streamoff>(destinationOffset));
+        assembled.read(reinterpret_cast<char*>(observed.data()), static_cast<std::streamsize>(amount));
+        if (!input || !assembled || !std::equal(expected.begin(), expected.begin() + amount, observed.begin())) {
+          result.error = "Unable to copy and verify the NTFS partition in the assembled image";
+          return result;
+        }
+        copied += amount;
+        offset += amount;
+        if (onProgress) onProgress({core::IsoDeploymentStage::Verifying, copied, total,
+                                   "Assembling and verifying NTFS image"});
+      }
+    }
+    assembled.close();
+    if (!assembled) {
+      result.error = "Unable to close the assembled NTFS image";
       return result;
     }
-    result = core::IsoImageStager{}.extractToDirectory(
-        plan, mountPath, onProgress, isCancelled);
-    const bool cleanedUp = cleanupDevices();
-    if (!result.success) {
-      return result;
+    if (plan.quickFormat()) {
+      result.writeRanges.push_back({0, partitionOffset});
+      for (const auto& range : partitionRanges) {
+        result.writeRanges.push_back({partitionOffset + range.offsetBytes, range.sizeBytes});
+      }
+      const auto tail = partitionOffset + partitionBytes;
+      result.writeRanges.push_back({tail, plan.target().capacityBytes - tail});
+      std::vector<core::RawWriteRange> merged;
+      for (const auto& range : result.writeRanges) {
+        if (!merged.empty() && merged.back().offsetBytes + merged.back().sizeBytes >= range.offsetBytes) {
+          auto& last = merged.back();
+          last.sizeBytes = std::max(last.offsetBytes + last.sizeBytes,
+                                   range.offsetBytes + range.sizeBytes) - last.offsetBytes;
+        } else {
+          merged.push_back(range);
+        }
+      }
+      result.writeRanges = std::move(merged);
     }
-    if (!cleanedUp) {
-      result.success = false;
-      result.error = "Unable to unmount or detach the NTFS staging image cleanly";
-      return result;
-    }
+    result.success = true;
 
     core::ImageInfo staged;
     staged.path = outputPath.string();
@@ -1378,7 +1408,8 @@ class PosixNtfsIsoImageStager final : public NtfsIsoImageStager {
     staged.architecture = plan.image().architecture;
     staged.bootable = true;
     staged.capabilities.rawWrite = true;
-    staged.capabilities.uefiBootable = true;
+    staged.capabilities.uefiBootable = plan.targetSystem() != core::IsoTargetSystem::Bios;
+    staged.capabilities.biosBootable = plan.legacyBiosBootstrap() == core::LegacyBiosBootstrap::WindowsBootManager;
     staged.capabilities.validPartitionTable = true;
     result.stagedImage = std::move(staged);
     scoped.keepOutput();
@@ -1891,7 +1922,7 @@ class WindowsNtfsIsoImageStager final : public NtfsIsoImageStager {
                   "Creating MBR, NTFS, and UEFI:NTFS partitions"});
     }
     if (!createNtfsIsoLayoutImage(outputPath, plan.target().capacityBytes,
-                                  plan.partitionScheme(), result.error) ||
+                                  plan.partitionScheme(), plan.targetSystem(), result.error) ||
         !appendFixedVhdFooter(outputPath, plan.target().capacityBytes,
                               result.error)) {
       return result;
@@ -1958,8 +1989,11 @@ class WindowsNtfsIsoImageStager final : public NtfsIsoImageStager {
     std::wstring mountedRoot;
     mountedRoot.push_back(letter);
     mountedRoot += L":\\";
+    const auto extractingProgress = [&](const core::IsoDeploymentProgress& progress) {
+      if (onProgress && progress.stage != core::IsoDeploymentStage::Complete) onProgress(progress);
+    };
     result = core::IsoImageStager{}.extractToDirectory(
-        plan, std::filesystem::path(mountedRoot), onProgress, isCancelled);
+        plan, std::filesystem::path(mountedRoot), extractingProgress, isCancelled);
     if (!detach()) {
       result.success = false;
       result.error = "diskpart could not detach the NTFS staging image";
@@ -1977,6 +2011,20 @@ class WindowsNtfsIsoImageStager final : public NtfsIsoImageStager {
       return result;
     }
 
+    if (plan.legacyBiosBootstrap() == core::LegacyBiosBootstrap::WindowsBootManager) {
+      std::ifstream layout(outputPath, std::ios::binary);
+      std::array<unsigned char, 512> mbr{};
+      layout.read(reinterpret_cast<char*>(mbr.data()), mbr.size());
+      std::uint64_t sectors = 0;
+      for (unsigned i = 0; i < 4; ++i) sectors |= std::uint64_t(mbr[458U + i]) << (8U * i);
+      if (!layout || !detail::installWindowsNtfsBootstrap(
+          outputPath, kPartitionAlignmentSectors * kSectorSize, sectors * kSectorSize, result.error)) {
+        result.success = false;
+        if (result.error.empty()) result.error = "Unable to read the Windows NTFS staging extent";
+        return result;
+      }
+    }
+
     core::ImageInfo staged;
     staged.path = outputPath.string();
     staged.displayName = outputPath.filename().string();
@@ -1989,7 +2037,8 @@ class WindowsNtfsIsoImageStager final : public NtfsIsoImageStager {
     staged.architecture = plan.image().architecture;
     staged.bootable = true;
     staged.capabilities.rawWrite = true;
-    staged.capabilities.uefiBootable = true;
+    staged.capabilities.uefiBootable = plan.targetSystem() != core::IsoTargetSystem::Bios;
+    staged.capabilities.biosBootable = plan.legacyBiosBootstrap() == core::LegacyBiosBootstrap::WindowsBootManager;
     staged.capabilities.validPartitionTable = true;
     result.stagedImage = std::move(staged);
     scoped.keepOutput();
@@ -2006,6 +2055,41 @@ class WindowsNtfsIsoImageStager final : public NtfsIsoImageStager {
 #endif
 
 }  // namespace
+
+NtfsIsoStagingRequirements estimateNtfsIsoStagingRequirements(
+    const std::uint64_t expandedImageBytes,
+    const std::uint64_t targetCapacityBytes, const bool quickFormat) {
+  NtfsIsoStagingRequirements result;
+  const auto overflow = [&] {
+    result.error = "The NTFS staging space requirement overflowed";
+    return result;
+  };
+  std::uint64_t allowance = targetCapacityBytes;
+  if (quickFormat) {
+    if (expandedImageBytes >
+        (std::numeric_limits<std::uint64_t>::max() - 9U) / 11U) {
+      return overflow();
+    }
+    allowance = (expandedImageBytes * 11U + 9U) / 10U;
+  }
+#if !defined(_WIN32)
+  // The formatted partition and assembled output coexist until verification.
+  if (allowance > std::numeric_limits<std::uint64_t>::max() / 2U) {
+    return overflow();
+  }
+  allowance *= 2U;
+#endif
+  if (allowance > std::numeric_limits<std::uint64_t>::max() -
+                      kNtfsStagingReserveBytes) {
+    return overflow();
+  }
+  result.temporaryBytes = allowance + kNtfsStagingReserveBytes;
+#if !defined(_WIN32)
+  result.writeSizePending = quickFormat;
+#endif
+  result.success = true;
+  return result;
+}
 
 std::unique_ptr<WindowsToGoImageStager> makePlatformWindowsToGoImageStager() {
 #if defined(_WIN32)
@@ -2025,28 +2109,31 @@ std::unique_ptr<NtfsIsoImageStager> makePlatformNtfsIsoImageStager() {
 
 NtfsIsoLayoutResult createNtfsIsoMbrImage(
     const std::filesystem::path& outputPath,
-    const std::uint64_t capacityBytes) {
-  NtfsIsoLayoutResult result;
-  result.success = createNtfsMbrImage(outputPath, capacityBytes, result.error);
-  if (!result.success) {
-    std::error_code ignored;
-    std::filesystem::remove(outputPath, ignored);
-  }
-  return result;
+    const std::uint64_t capacityBytes,
+    const core::IsoTargetSystem targetSystem) {
+  return createNtfsIsoDiskImage(outputPath, capacityBytes, core::PartitionScheme::Mbr, targetSystem);
 }
 
 NtfsIsoLayoutResult createNtfsIsoDiskImage(
     const std::filesystem::path& outputPath,
     const std::uint64_t capacityBytes,
-    const core::PartitionScheme partitionScheme) {
+    const core::PartitionScheme partitionScheme,
+    const core::IsoTargetSystem targetSystem) {
   NtfsIsoLayoutResult result;
+  std::error_code fileError;
+  const auto status = std::filesystem::symlink_status(outputPath, fileError);
+  if (std::filesystem::exists(status) ||
+      (fileError && fileError != std::errc::no_such_file_or_directory)) {
+    result.error = "The NTFS layout output already exists or cannot be inspected";
+    return result;
+  }
   if (partitionScheme != core::PartitionScheme::Mbr &&
       partitionScheme != core::PartitionScheme::Gpt) {
     result.error = "A concrete MBR or GPT NTFS layout is required";
     return result;
   }
   result.success = createNtfsIsoLayoutImage(
-      outputPath, capacityBytes, partitionScheme, result.error);
+      outputPath, capacityBytes, partitionScheme, targetSystem, result.error);
   if (!result.success) {
     std::error_code ignored;
     std::filesystem::remove(outputPath, ignored);

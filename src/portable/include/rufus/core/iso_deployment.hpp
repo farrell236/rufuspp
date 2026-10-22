@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -23,6 +24,7 @@
 #include "rufus/core/safety_policy.hpp"
 #include "rufus/core/wim_splitter.hpp"
 #include "rufus/core/windows_to_go.hpp"
+#include "rufus/core/write_range.hpp"
 
 namespace rufus::core {
 
@@ -59,8 +61,8 @@ struct IsoDeploymentOptions final {
   // fixture; production callers should keep the defaults.
   std::uint64_t maximumFatFileBytes{0xffffffffULL};
   std::uint64_t wimSplitPartBytes{3800ULL * 1024ULL * 1024ULL};
-  // Set by a host integration only when it can create and mount an NTFS
-  // staging image and install the UEFI:NTFS bootstrap.
+  // Set by a host integration when it can create, populate and verify NTFS
+  // staging images and install the requested BIOS/UEFI bootstraps.
   bool ntfsAvailable{};
   // Unknown preserves the traditional automatic MBR choice. GPT is valid for
   // UEFI-only deployment and includes primary and backup partition tables.
@@ -136,6 +138,13 @@ class IsoDeploymentPlan final {
   [[nodiscard]] bool splitsWindowsImage() const noexcept { return splitWindowsImage_; }
   [[nodiscard]] bool hasLinuxPersistence() const noexcept {
     return linuxPersistenceStyle_ != LinuxPersistenceStyle::None;
+  }
+  // Only compact quick MBR/FAT32 stages leave the target's end unwritten.
+  // Persistence, GPT and full-format stages already include that region.
+  [[nodiscard]] bool requiresTrailingMetadataClear() const noexcept {
+    return fileSystem_ == IsoDeploymentFilesystem::Fat32 &&
+           partitionScheme_ == PartitionScheme::Mbr && options_.quickFormat &&
+           !hasLinuxPersistence();
   }
   [[nodiscard]] LinuxPersistenceStyle linuxPersistenceStyle() const noexcept {
     return linuxPersistenceStyle_;
@@ -248,6 +257,9 @@ struct IsoDeploymentResult final {
   std::uint64_t filesExtracted{};
   std::uint64_t bytesExtracted{};
   std::optional<ImageInfo> stagedImage;
+  // Empty means a dense write. Quick stages may describe initialized ranges
+  // inside a full-size sparse source; omitted bytes are unallocated space.
+  std::vector<RawWriteRange> writeRanges;
   std::string error;
 };
 
@@ -255,12 +267,30 @@ using IsoDeploymentProgressCallback =
     std::function<void(const IsoDeploymentProgress&)>;
 using IsoDeploymentCancelCallback = std::function<bool()>;
 
+// Sequential file operations let the validated ISO extractor target a filesystem
+// library directly. Paths are validated relative ISO paths; implementations must
+// reject existing files and flush all metadata before reopening read-only.
+class IsoDeploymentFileTree {
+ public:
+  virtual ~IsoDeploymentFileTree() = default;
+  virtual bool createDirectories(const std::string& path, std::string& error) = 0;
+  virtual bool createFile(const std::string& path, std::string& error) = 0;
+  virtual bool write(const unsigned char* data, std::size_t size, std::string& error) = 0;
+  virtual bool closeFile(std::string& error) = 0;
+  virtual bool reopenReadOnly(std::string& error) = 0;
+  virtual bool openFileForRead(const std::string& path, std::uint64_t expectedSize,
+                               std::string& error) = 0;
+  virtual bool read(unsigned char* data, std::size_t size, std::string& error) = 0;
+};
+
 class IsoImageStager final {
  public:
   // outputPath must not exist. On success it contains the sector-aligned
   // initialized portion of a complete FAT32 disk layout. Quick MBR plans may
   // use a compact prefix; GPT and full-format plans include the complete sparse
-  // target so backup tables and zero-fill semantics reach the raw writer.
+  // target. For quick GPT/persistence stages, pass result.writeRanges to the
+  // writer so initialized metadata reaches its disk offsets without copying
+  // unallocated space. Full formats leave that map empty for dense zero-fill.
   [[nodiscard]] IsoDeploymentResult stage(
       const IsoDeploymentPlan& plan, const std::filesystem::path& outputPath,
       const IsoDeploymentProgressCallback& onProgress = {},
@@ -271,6 +301,11 @@ class IsoImageStager final {
   // formatting, mounting, and the UEFI:NTFS bootstrap.
   [[nodiscard]] IsoDeploymentResult extractToDirectory(
       const IsoDeploymentPlan& plan, const std::filesystem::path& outputRoot,
+      const IsoDeploymentProgressCallback& onProgress = {},
+      const IsoDeploymentCancelCallback& isCancelled = {}) const;
+
+  [[nodiscard]] IsoDeploymentResult extractToFileTree(
+      const IsoDeploymentPlan& plan, IsoDeploymentFileTree& destination,
       const IsoDeploymentProgressCallback& onProgress = {},
       const IsoDeploymentCancelCallback& isCancelled = {}) const;
 };

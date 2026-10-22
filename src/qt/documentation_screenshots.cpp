@@ -42,7 +42,9 @@
 
 #include "rufus/core/application_info.hpp"
 #include "rufus/core/image_analyzer.hpp"
+#include "rufus/core/iso_deployment.hpp"
 #include "rufus/core/media.hpp"
+#include "rufus/core/raw_image_writer.hpp"
 #include "rufus/core/windows_to_go.hpp"
 #include "windows_user_experience_dialog.hpp"
 
@@ -263,6 +265,8 @@ bool MainWindow::generateDocumentationScreenshots(
     progressBar_->setRange(0, 100);
     progressBar_->setValue(0);
     progressBar_->setFormat("ANALYZED — READY");
+    operationProgressLabel_->hide();
+    progressStage_.clear();
     statusBar()->showMessage("Example media analyzed — review settings before starting");
     checksumButton_->setEnabled(true);
     captureButton_->setEnabled(true);
@@ -327,6 +331,21 @@ bool MainWindow::generateDocumentationScreenshots(
                             "windows-installation-mode.png", error)) {
     return false;
   }
+
+  // Fictional display state only: no worker, source file or device is opened.
+  isoDeploymentRunning_ = true;
+  progressElapsedMs_ = 83 * 1000;
+  handleWriteProgress({core::RawWriteStage::Writing,
+                       4ULL * kGibibyte, 8ULL * kGibibyte});
+  startButton_->setEnabled(false);
+  closeButton_->setText("CANCEL");
+  fitWindowToContents();
+  if (!saveWidgetScreenshot(*this, outputDirectory,
+                            "write-progress.png", error)) {
+    return false;
+  }
+  isoDeploymentRunning_ = false;
+  progressElapsedMs_ = 0;
 
   imageOptionBox_->setCurrentIndex(
       imageOptionBox_->findData("windows-to-go"));
@@ -559,18 +578,24 @@ bool MainWindow::generateDocumentationScreenshots(
       "The preflight report is ready. Expand Show Details to review the exact "
       "layout, transformations, dependencies and verification policy.\n\n"
       "All existing data on the target will be lost.");
+  core::DeploymentPreflightInput preflight;
+  preflight.operation = "Windows installation media";
+  preflight.image = documentationWindowsImage();
+  preflight.target = demoDevice;
+  preflight.partitionScheme = "MBR";
+  preflight.targetSystem = "BIOS + UEFI";
+  preflight.fileSystem = "NTFS + UEFI:NTFS";
+  preflight.quickFormat = true;
+  preflight.bytesToWrite = preflight.temporaryBytes = demoDevice.capacityBytes;
+  configureIsoPreflightSizing(preflight, core::IsoDeploymentFilesystem::Ntfs);
+  preflight.transformations = {
+      "Extract and byte-verify the optical-image file tree",
+      "Install the offline UEFI:NTFS helper partition",
+      "Install Windows legacy BIOS boot code and its backup boot sector"};
+  preflight.dependencies.push_back(
+      {"NTFS staging provider", true, true, "Documentation example"});
   confirmationBox.setDetailedText(
-      "Operation: Windows installation media\n"
-      "Source: Win11_24H2_English_x64.iso\n"
-      "Target: Example USB Drive (64 GiB)\n"
-      "Partition scheme: MBR\n"
-      "Target system: BIOS + UEFI\n"
-      "Filesystem: NTFS + UEFI:NTFS\n"
-      "Verification: Standard (all written data)\n\n"
-      "Transformations\n"
-      "  Extract and byte-verify the optical-image file tree\n"
-      "  Install the offline UEFI:NTFS helper partition\n\n"
-      "Status: READY");
+      QString::fromStdString(core::buildDeploymentPreflight(preflight).toText()));
   confirmationBox.setStandardButtons(QMessageBox::Yes | QMessageBox::Cancel);
   confirmationBox.setDefaultButton(QMessageBox::Cancel);
   confirmationBox.show();

@@ -154,7 +154,9 @@ DeploymentPreflightReport buildDeploymentPreflight(
               input.quickFormat ? "Quick" : "Full overwrite");
   appendEntry(report, "Verification",
               verificationProfileName(input.verificationProfile));
-  appendEntry(report, "Write size", std::string(formatByteSize(input.bytesToWrite)));
+  appendEntry(report, "Write size", input.writeSizePending
+      ? "Calculated during preparation" : std::string(formatByteSize(input.bytesToWrite)),
+      input.writeSizePending ? "Quick format skips unallocated space; progress shows the actual transfer total." : "");
   if (input.temporaryBytes != 0U) {
     appendEntry(report, "Temporary space",
                 std::string(formatByteSize(input.temporaryBytes)));

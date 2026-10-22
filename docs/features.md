@@ -78,15 +78,27 @@ guarded writer.
 - Alternate supported GRUB directory layouts are aliased to the bootstrap's
   expected path.
 
-NTFS/UEFI:NTFS ISO mode is dependency-gated. It creates an MBR or GPT NTFS data
-partition plus the embedded UEFI:NTFS helper partition, extracts and verifies
-every source file, and sends the resulting disk image to the native writer.
+NTFS ISO mode creates an MBR or GPT NTFS data partition, extracts and verifies
+every source file, and sends the staged image to the guarded native writer.
+macOS/Linux use a bundled direct NTFS library and private formatter without
+mounting the filesystem or installing macFUSE/ntfs-3g. Windows uses native
+DiskPart staging. UEFI targets include the embedded UEFI:NTFS helper; supported
+Windows MBR BIOS targets receive BOOTMGR boot code instead, and dual-mode media
+includes both boot paths.
+
+Quick FAT32 stages on all hosts and quick NTFS stages on macOS/Linux export
+formatter-authored write ranges. Required zero metadata, backup structures and
+the disk tail are included; free space is skipped. Full formats retain dense
+overwrite semantics. Windows NTFS staging currently commits a dense image even
+when its filesystem format is quick.
 
 ### Windows installation media
 
-Standard Windows Setup deployment supports FAT32 and UEFI. On 512-byte-sector
-targets, BIOS-capable images also receive an active Windows-compatible MBR and
-BOOTMGR FAT32 bootstrap.
+Standard Windows Setup deployment supports FAT32 and NTFS. GPT targets are
+UEFI-only. On 512-byte-sector targets, supported x86/x64 Windows MBR media can
+boot through legacy BIOS or BIOS + UEFI. The NTFS BIOS path installs Windows MBR
+and BOOTMGR volume boot code, preserves filesystem parameters, and updates and
+verifies the backup boot sector. BIOS-only NTFS omits the UEFI helper.
 
 When `sources/install.wim` or `sources/install.esd` exceeds the FAT32 file-size
 limit, wimlib converts solid ESD resources when necessary and creates validated
@@ -121,13 +133,16 @@ layouts remain available for ordinary ISO or exact DD deployment without a
 persistence control. The available persistence size is calculated from target
 capacity after reserving 110% of the extracted ISO payload.
 
-The portable stager creates a second MBR partition containing a verified ext2
-filesystem:
+The portable stager creates a Linux partition after FAT32 in the selected MBR
+or GPT layout, containing a verified ext2 filesystem:
 
 - Ubuntu/Casper media uses the `casper-rw` label.
 - Debian-style media uses the `persistence` label and `/persistence.conf`.
 - Recognized GRUB and Syslinux entries are patched idempotently.
-- Affected MD5 manifests are updated before the complete image is written.
+- Affected MD5 manifests are updated before the initialized image ranges are written.
+- Casper receives a UUID-pinned shutdown hook to finalize its backing filesystem
+  read-only. Shut the live system down normally before disconnecting the USB;
+  ext2 is not a journaling filesystem.
 
 Custom persistence implementations are not treated as generic Debian Live
 media. In particular, Tails retains its native encrypted `TailsData` workflow,
@@ -260,6 +275,13 @@ the platform application-data directory. It includes bytes written and
 verified, operation status, and the source SHA-256 if it was calculated for the
 current image.
 
+Preflight uses the same NTFS temporary-space calculation as the backend guard,
+including both staging files on macOS/Linux. Write size stays pending until
+preparation determines quick FAT32 and macOS/Linux NTFS transfer ranges; receipts
+record the preflight statement and actual outcome counts. Separate progress text
+shows the current stage, percentage, byte count and elapsed time, including time
+spent flushing without claiming completion.
+
 Long operations inhibit host sleep and use a progress-stall watchdog without
 forcibly interrupting an in-flight device write.
 
@@ -293,7 +315,7 @@ identity immediately before destructive access.
 | Raw/DD and compressed images | Signed helper or development root process | Elevated process | Elevated process |
 | Apple installer application | `createinstallmedia` through signed helper or development root process | Unavailable | Unavailable |
 | FAT32 ISO and Windows Setup | Portable stager + native writer | Portable stager + native writer | Portable stager + native writer |
-| NTFS/UEFI:NTFS ISO | Host tools | Host tools, elevated | DiskPart, elevated |
+| NTFS ISO (BIOS/UEFI) | Bundled direct NTFS library/formatter + native writer | Bundled direct NTFS library/formatter + native writer | DiskPart + native writer, elevated |
 | Linux persistence | Portable stager + native writer | Portable stager + native writer | Portable stager + native writer |
 | Windows To Go | wimlib + host tools + BCD-SYS | wimlib + host tools + BCD-SYS | wimlib + DiskPart + BCDBoot |
 | FFU apply/capture | Analysis only | Analysis only | DISM, elevated |
@@ -313,21 +335,24 @@ The base Qt application requires:
 
 - CMake 3.24 or later
 - A C++17 compiler
+- A C compiler and `make` on macOS/Linux for the bundled NTFS build
 - Qt 6.5 or later with Widgets and Network
 - zlib, libbz2, liblzma, and libzstd development libraries
 
 ### Optional runtime dependencies
 
-- **Large Windows Setup images:** wimlib 1.13.4 or later for WIM/ESD conversion
-  and splitting.
+- **Large Windows Setup images on FAT32:** wimlib 1.13.4 or later for WIM/ESD
+  conversion and splitting. Standard NTFS ISO mode keeps the original install
+  image and does not need wimlib for that transformation.
 - **Windows To Go:** wimlib 1.13.4 or later. Windows uses built-in DiskPart and
   BCDBoot. Linux additionally needs `losetup`, `mkfs.fat`, `mkntfs`, `ntfs-3g`,
   `mount`, BCD-SYS, `hivexsh`, `hivexregedit`, `peres`, `xxd`, `setfattr`, and
   `fatattr`. macOS needs `hdiutil`, `diskutil`, `newfs_msdos`, `mkntfs`,
   `ntfs-3g`, BCD-SYS, `hivexsh`, `hivexregedit`, `peres`, and `xxd`.
-- **NTFS/UEFI:NTFS ISO:** Windows uses built-in DiskPart. Linux needs
-  `losetup`, `mkntfs`, `ntfs-3g`, and `umount`. macOS needs `hdiutil`, `mkntfs`,
-  `ntfs-3g`, and `umount`.
+- **Standard NTFS ISO:** macOS/Linux packages include static libntfs-3g and the
+  private `rufus-mkntfs` formatter; no host NTFS/FUSE installation, mount, or
+  `losetup` is required. Windows uses built-in DiskPart. All hosts still need
+  their normal privileged native writer for the final physical USB commit.
 - **FFU:** Windows DISM with `/Apply-Ffu` or `/Capture-Ffu`.
 - **macOS installer media:** macOS 13 or later, a complete Apple-signed
   installer containing `createinstallmedia`, a signed and registered Rufus++
@@ -354,14 +379,18 @@ applications.
   to local development and hardware testing.
 - Linux and Windows still use whole-process elevation rather than dedicated
   least-privilege helpers.
-- Cross-platform removable-hardware and fault-injection qualification remains
-  outstanding.
-- Windows To Go, NTFS ISO mode, and host-specific formats are unavailable when
-  their complete external toolchains are missing.
+- Broad cross-platform removable-hardware, disconnect and power-loss
+  qualification is incomplete. Specific macOS physical-USB results and local
+  fault-injection coverage are recorded in [write-testing.md](write-testing.md).
+- Windows To Go and host-specific formats remain unavailable when their external
+  toolchains are missing. Standard NTFS ISO mode instead requires its bundled
+  components on macOS/Linux, or native DiskPart on Windows.
 - Legacy Syslinux-only BIOS media, uncommon UDF layouts, differencing VHD
   chains, and active-log VHDX images are deliberately restricted.
-- QEMU validation is a smoke test, not proof that an image reaches an expected
-  boot screen.
+- The built-in Virtual boot test is a bounded launch smoke test. Separate
+  manual physical-USB runs observed Ubuntu boots/persistence and Windows Setup
+  under QEMU firmware. Those observations do not establish actual-machine
+  firmware compatibility, Secure Boot, or Windows installation success.
 
 Portable-core, backend, platform-discovery, and headless Qt tests are available
 through CTest.

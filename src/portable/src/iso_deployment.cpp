@@ -1651,7 +1651,9 @@ bool writeDirectories(std::ofstream& output, const FatLayout& layout,
       writeShortEntry(bytes.data() + offset, dot, 0x10, directory->firstCluster, 0);
       offset += 32U;
       dot[1] = '.';
-      const std::uint32_t parentCluster = directory->parent->firstCluster;
+      // FAT32 uses zero for a root parent, even though the root has a cluster.
+      const std::uint32_t parentCluster = directory->parent->parent == nullptr
+                                              ? 0U : directory->parent->firstCluster;
       writeShortEntry(bytes.data() + offset, dot, 0x10, parentCluster, 0);
       offset += 32U;
     }
@@ -2435,16 +2437,24 @@ IsoDeploymentPlanResult IsoDeploymentPlanner::build(const ImageInfo& image,
            "Linux persistence cannot be combined with an ISO that requires NTFS staging"});
       return result;
     }
-    if (!targetNeedsUefi) {
+    const bool hasBootmgr = std::any_of(
+        content->files.begin(), content->files.end(),
+        [](const detail::ImageFileRecord& file) {
+          return asciiFold(file.path) == "bootmgr" && file.sizeBytes != 0;
+        });
+    if (targetNeedsBios &&
+        (!windowsBiosBootable || !hasBootmgr ||
+         (image.architecture != ImageArchitecture::X86 &&
+          image.architecture != ImageArchitecture::X64))) {
       result.issues.push_back(
           {SafetyIssueCode::ModeUnsupported,
-           "NTFS ISO deployment requires a UEFI target for the UEFI:NTFS bootstrap"});
+           "NTFS legacy BIOS boot requires an x86/x64 Windows installer with a root BOOTMGR file"});
       return result;
     }
     if (target.logicalSectorSize != 512U) {
       result.issues.push_back(
           {SafetyIssueCode::InvalidSectorSize,
-           "UEFI:NTFS staging currently requires a 512-byte-sector target"});
+           "NTFS staging currently requires a 512-byte-sector target"});
       return result;
     }
     if (partitionScheme == PartitionScheme::Mbr &&
@@ -2464,8 +2474,10 @@ IsoDeploymentPlanResult IsoDeploymentPlanner::build(const ImageInfo& image,
     // NTFS can retain the original install image. Splitting is only a FAT32
     // compatibility transformation.
     splitWindowsImage = false;
-    result.warnings.emplace_back(
-        "The ISO will be extracted to NTFS and booted through the UEFI:NTFS helper partition");
+    if (targetNeedsUefi) result.warnings.emplace_back(
+        "The ISO will be extracted to NTFS with the UEFI:NTFS helper partition");
+    if (targetNeedsBios) result.warnings.emplace_back(
+        "Windows MBR and NTFS BOOTMGR boot code will be installed for legacy BIOS boot");
   }
   if (requiresNtfs && options_.clusterSizeBytes != 0U &&
       (target.logicalSectorSize == 0U ||
@@ -2516,9 +2528,7 @@ IsoDeploymentPlanResult IsoDeploymentPlanner::build(const ImageInfo& image,
                 ignoredLayout.sectorBytes
           : 0U;
   const LegacyBiosBootstrap legacyBiosBootstrap =
-      requiresNtfs
-          ? LegacyBiosBootstrap::None
-      : windowsBiosBootable
+      windowsBiosBootable
           ? LegacyBiosBootstrap::WindowsBootManager
           : grubBiosBootable ? LegacyBiosBootstrap::Grub2
                               : LegacyBiosBootstrap::None;
@@ -2721,10 +2731,8 @@ IsoDeploymentResult IsoImageStager::stage(
   const std::uint64_t fatStagedBytes = layout.clusterOffset(nextCluster - 1U) +
                                        layout.clusterBytes();
   const std::uint64_t stagedBytes =
-      plan.hasLinuxPersistence() || !plan.quickFormat() ||
-              plan.partitionScheme() == PartitionScheme::Gpt
-          ? plan.target().capacityBytes
-          : fatStagedBytes;
+      plan.requiresTrailingMetadataClear() ? fatStagedBytes
+                                           : plan.target().capacityBytes;
   const std::uint64_t reservedTailBytes = std::min<std::uint64_t>(
       kMebibyte, plan.target().capacityBytes);
   const std::uint64_t usableDataEnd =
@@ -2808,6 +2816,7 @@ IsoDeploymentResult IsoImageStager::stage(
     ++result.filesExtracted;
   }
   detail::Ext2FormatOptions persistenceFormat;
+  std::vector<RawWriteRange> initializedRanges{{0U, fatStagedBytes}};
   if (plan.hasLinuxPersistence()) {
     if (onProgress) {
       onProgress({IsoDeploymentStage::CreatingPersistence, 0,
@@ -2824,8 +2833,10 @@ IsoDeploymentResult IsoImageStager::stage(
             : "persistence";
     persistenceFormat.createPersistenceConf =
         plan.linuxPersistenceStyle_ == LinuxPersistenceStyle::DebianLive;
+    persistenceFormat.casperShutdownHook =
+        plan.linuxPersistenceStyle_ == LinuxPersistenceStyle::Casper;
     if (!detail::writeExt2Filesystem(output, persistenceFormat, isCancelled,
-                                     result.error)) {
+                                     result.error, &initializedRanges)) {
       return fail(result.error, isCancelled && isCancelled());
     }
     if (onProgress) {
@@ -2958,6 +2969,27 @@ IsoDeploymentResult IsoImageStager::stage(
   result.success = true;
   result.bytesExtracted = extracted;
   result.stagedImage = std::move(stagedImage);
+  if (plan.quickFormat() && !plan.requiresTrailingMetadataClear()) {
+    // Copy the final metadata area from the new image: this removes stale GPT
+    // signatures for MBR while preserving new GPT tables or ext2 metadata.
+    initializedRanges.push_back({plan.target().capacityBytes - reservedTailBytes,
+                                 reservedTailBytes});
+    std::sort(initializedRanges.begin(), initializedRanges.end(),
+              [](const auto& left, const auto& right) {
+                return left.offsetBytes < right.offsetBytes;
+              });
+    for (const auto& range : initializedRanges) {
+      if (!result.writeRanges.empty() &&
+          range.offsetBytes <= result.writeRanges.back().offsetBytes +
+                                   result.writeRanges.back().sizeBytes) {
+        auto& previous = result.writeRanges.back();
+        previous.sizeBytes = std::max(previous.offsetBytes + previous.sizeBytes,
+                                      range.offsetBytes + range.sizeBytes) - previous.offsetBytes;
+      } else {
+        result.writeRanges.push_back(range);
+      }
+    }
+  }
   ownsOutput = false;
   if (onProgress) {
     onProgress({IsoDeploymentStage::Complete, totalFileBytes, totalFileBytes, {}});
@@ -2965,8 +2997,120 @@ IsoDeploymentResult IsoImageStager::stage(
   return result;
 }
 
+namespace {
+class DirectoryFileTree final : public IsoDeploymentFileTree {
+ public:
+  explicit DirectoryFileTree(std::filesystem::path root) : root_(std::move(root)) {}
+  bool createDirectories(const std::string& path, std::string& error) override {
+    std::filesystem::path current = root_;
+    for (const auto& part : std::filesystem::u8path(path)) {
+      current /= part;
+      std::error_code ec;
+      const auto status = std::filesystem::symlink_status(current, ec);
+      if ((ec && ec != std::errc::no_such_file_or_directory) ||
+          std::filesystem::is_symlink(status)) {
+        error = "Refusing an inaccessible or symbolic-link staging directory: " + path;
+        return false;
+      }
+      ec.clear();
+      std::filesystem::create_directories(current, ec);
+      if (ec) {
+        error = "Unable to create staging directory " + path + ": " + ec.message();
+        return false;
+      }
+    }
+    return true;
+  }
+  bool createFile(const std::string& path, std::string& error) override {
+    const auto relative = std::filesystem::u8path(path);
+    if (!closeFile(error) || !createDirectories(relative.parent_path().generic_u8string(), error)) {
+      return false;
+    }
+    const auto destination = root_ / relative;
+    std::error_code ec;
+    const auto status = std::filesystem::symlink_status(destination, ec);
+    if ((ec && ec != std::errc::no_such_file_or_directory) ||
+        std::filesystem::exists(status) || std::filesystem::is_symlink(status)) {
+      error = "Refusing to replace an existing or inaccessible staging file: " + path;
+      return false;
+    }
+    output_.clear();
+    output_.open(destination, std::ios::binary | std::ios::trunc);
+    if (!output_) {
+      error = "Unable to create staging file: " + path;
+      return false;
+    }
+    return true;
+  }
+  bool write(const unsigned char* data, const std::size_t size, std::string& error) override {
+    output_.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
+    if (!output_) {
+      error = "Unable to write staging file";
+      return false;
+    }
+    return true;
+  }
+  bool closeFile(std::string& error) override {
+    if (output_.is_open()) {
+      output_.flush();
+      output_.close();
+      if (!output_) {
+        error = "Unable to flush or close staging file";
+        return false;
+      }
+    }
+    if (input_.is_open()) {
+      input_.close();
+    }
+    return true;
+  }
+  bool reopenReadOnly(std::string& error) override { return closeFile(error); }
+  bool openFileForRead(const std::string& path, const std::uint64_t expectedSize,
+                       std::string& error) override {
+    if (!closeFile(error)) {
+      return false;
+    }
+    input_.clear();
+    input_.open(root_ / std::filesystem::u8path(path), std::ios::binary | std::ios::ate);
+    if (!input_ || input_.tellg() < 0 ||
+        static_cast<std::uint64_t>(input_.tellg()) != expectedSize) {
+      error = "Unable to reopen staging file, or its size changed: " + path;
+      return false;
+    }
+    input_.seekg(0);
+    return static_cast<bool>(input_);
+  }
+  bool read(unsigned char* data, const std::size_t size, std::string& error) override {
+    input_.read(reinterpret_cast<char*>(data), static_cast<std::streamsize>(size));
+    if (!input_) {
+      error = "Unable to read staging file";
+      return false;
+    }
+    return true;
+  }
+ private:
+  std::filesystem::path root_;
+  std::ofstream output_;
+  std::ifstream input_;
+};
+}  // namespace
+
 IsoDeploymentResult IsoImageStager::extractToDirectory(
     const IsoDeploymentPlan& plan, const std::filesystem::path& outputRoot,
+    const IsoDeploymentProgressCallback& onProgress,
+    const IsoDeploymentCancelCallback& isCancelled) const {
+  std::error_code ec;
+  if (!std::filesystem::is_directory(outputRoot, ec) || ec) {
+    IsoDeploymentResult result;
+    result.error = "The ISO extraction root is not an accessible directory";
+    return result;
+  }
+  DirectoryFileTree destination(outputRoot);
+  return extractToFileTree(plan, destination, onProgress, isCancelled);
+}
+
+IsoDeploymentResult IsoImageStager::extractToFileTree(
+    const IsoDeploymentPlan& plan, IsoDeploymentFileTree& tree,
     const IsoDeploymentProgressCallback& onProgress,
     const IsoDeploymentCancelCallback& isCancelled) const {
   IsoDeploymentResult result;
@@ -2992,30 +3136,20 @@ IsoDeploymentResult IsoImageStager::extractToDirectory(
     result.error = "Unable to open the source ISO for deployment";
     return result;
   }
-  std::error_code fileError;
-  if (!std::filesystem::is_directory(outputRoot, fileError) || fileError) {
-    result.error = fileError
-                       ? "Unable to access the mounted NTFS filesystem: " +
-                             fileError.message()
-                       : "The NTFS extraction root is not a directory";
-    return result;
-  }
-
   std::set<std::string> normalizedPaths;
   std::vector<std::string> components;
   const auto checkedDestination = [&](const std::string& path,
-                                      std::filesystem::path& destination,
+                                      std::string& destination,
                                       std::string& error) {
     if (!splitPath(path, components, error) || components.empty()) {
       return false;
     }
-    destination = outputRoot;
+    destination = path;
     for (const auto& component : components) {
       std::u16string ignored;
       if (!validateComponent(component, ignored, error)) {
         return false;
       }
-      destination /= std::filesystem::u8path(component);
     }
     const std::string key = asciiFold(path);
     if (!normalizedPaths.emplace(key).second) {
@@ -3029,26 +3163,11 @@ IsoDeploymentResult IsoImageStager::extractToDirectory(
     if (!entry.directory) {
       continue;
     }
-    std::filesystem::path destination;
+    std::string destination;
     if (!checkedDestination(entry.path, destination, result.error)) {
       return result;
     }
-    const auto status = std::filesystem::symlink_status(destination, fileError);
-    if (fileError && fileError != std::errc::no_such_file_or_directory) {
-      result.error = "Unable to inspect the NTFS destination path: " +
-                     fileError.message();
-      return result;
-    }
-    fileError.clear();
-    if (std::filesystem::is_symlink(status)) {
-      result.error = "Refusing a symbolic link in the NTFS staging tree: " +
-                     entry.path;
-      return result;
-    }
-    std::filesystem::create_directories(destination, fileError);
-    if (fileError) {
-      result.error = "Unable to create NTFS directory " + entry.path + ": " +
-                     fileError.message();
+    if (!tree.createDirectories(destination, result.error)) {
       return result;
     }
   }
@@ -3078,30 +3197,11 @@ IsoDeploymentResult IsoImageStager::extractToDirectory(
   const auto writeOne = [&](const std::string& path,
                             const detail::ImageFileRecord* source,
                             const std::string_view embedded) {
-    std::filesystem::path destination;
+    std::string destination;
     if (!checkedDestination(path, destination, result.error)) {
       return false;
     }
-    std::filesystem::create_directories(destination.parent_path(), fileError);
-    if (fileError) {
-      result.error = "Unable to create the parent directory for " + path + ": " +
-                     fileError.message();
-      return false;
-    }
-    const auto status = std::filesystem::symlink_status(destination, fileError);
-    if (fileError && fileError != std::errc::no_such_file_or_directory) {
-      result.error = "Unable to inspect the NTFS destination file: " +
-                     fileError.message();
-      return false;
-    }
-    fileError.clear();
-    if (std::filesystem::exists(status) || std::filesystem::is_symlink(status)) {
-      result.error = "Refusing to replace an existing NTFS staging path: " + path;
-      return false;
-    }
-    std::ofstream output(destination, std::ios::binary | std::ios::trunc);
-    if (!output) {
-      result.error = "Unable to create NTFS staging file: " + path;
+    if (!tree.createFile(destination, result.error)) {
       return false;
     }
     const std::uint64_t size = source == nullptr ? embedded.size() : source->sizeBytes;
@@ -3122,10 +3222,7 @@ IsoDeploymentResult IsoImageStager::extractToDirectory(
         result.error += " (while extracting " + path + ')';
         return false;
       }
-      output.write(reinterpret_cast<const char*>(buffer.data()),
-                   static_cast<std::streamsize>(amount));
-      if (!output) {
-        result.error = "Unable to write NTFS staging file: " + path;
+      if (!tree.write(buffer.data(), amount, result.error)) {
         return false;
       }
       offset += amount;
@@ -3134,9 +3231,7 @@ IsoDeploymentResult IsoImageStager::extractToDirectory(
         onProgress({IsoDeploymentStage::Extracting, extracted, totalBytes, path});
       }
     }
-    output.flush();
-    if (!output) {
-      result.error = "Unable to flush NTFS staging file: " + path;
+    if (!tree.closeFile(result.error)) {
       return false;
     }
     ++result.filesExtracted;
@@ -3161,21 +3256,22 @@ IsoDeploymentResult IsoImageStager::extractToDirectory(
     return result;
   }
 
+  if (!tree.reopenReadOnly(result.error)) {
+    return result;
+  }
   std::uint64_t verified = 0;
   normalizedPaths.clear();
   const auto verifyOne = [&](const std::string& path,
                              const detail::ImageFileRecord* source,
                              const std::string_view embedded) {
-    std::filesystem::path destination;
+    std::string destination;
     if (!checkedDestination(path, destination, result.error)) {
       return false;
     }
-    std::ifstream input(destination, std::ios::binary);
-    if (!input) {
-      result.error = "Unable to reopen NTFS staging file: " + path;
+    const std::uint64_t size = source == nullptr ? embedded.size() : source->sizeBytes;
+    if (!tree.openFileForRead(destination, size, result.error)) {
       return false;
     }
-    const std::uint64_t size = source == nullptr ? embedded.size() : source->sizeBytes;
     std::uint64_t offset = 0;
     std::vector<unsigned char> observed(buffer.size());
     while (offset < size) {
@@ -3194,9 +3290,8 @@ IsoDeploymentResult IsoImageStager::extractToDirectory(
         result.error += " (while verifying " + path + ')';
         return false;
       }
-      input.read(reinterpret_cast<char*>(observed.data()),
-                 static_cast<std::streamsize>(amount));
-      if (!input || !std::equal(buffer.begin(), buffer.begin() + amount,
+      if (!tree.read(observed.data(), amount, result.error) ||
+          !std::equal(buffer.begin(), buffer.begin() + amount,
                                 observed.begin())) {
         result.error = "NTFS staging verification failed for " + path;
         return false;
@@ -3207,12 +3302,7 @@ IsoDeploymentResult IsoImageStager::extractToDirectory(
         onProgress({IsoDeploymentStage::Verifying, verified, totalBytes, path});
       }
     }
-    char extra = 0;
-    if (input.read(&extra, 1)) {
-      result.error = "NTFS staging file has an unexpected size: " + path;
-      return false;
-    }
-    return true;
+    return tree.closeFile(result.error);
   };
   for (const auto& file : plan.content_->files) {
     const bool unattended = !plan.windowsUnattendXml().empty() &&

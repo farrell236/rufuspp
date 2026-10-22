@@ -44,6 +44,8 @@
 
 #include "rufus/core/raw_image_writer.hpp"
 #include "rufus/core/image_analyzer.hpp"
+#include "system_raw_io.hpp"
+#include "raw_write_safety.hpp"
 #include "rufus/core/safety_policy.hpp"
 #include "rufus/core/write_plan.hpp"
 #if !RUFUSPP_MACOS_UNSIGNED_ROOT_MODE
@@ -451,71 +453,7 @@ class DiskArbitrationAccess final {
   bool claimed_{};
 };
 
-class MacRawTarget final : public core::RawTargetIo {
- public:
-  MacRawTarget(const int descriptor, const std::uint64_t capacity,
-               const std::uint32_t sectorSize)
-      : descriptor_(descriptor), capacity_(capacity), sectorSize_(sectorSize) {}
-
-  [[nodiscard]] std::uint64_t capacityBytes() const noexcept override { return capacity_; }
-  [[nodiscard]] std::uint32_t logicalSectorSize() const noexcept override {
-    return sectorSize_;
-  }
-
-  bool writeAt(const std::uint64_t offset, const unsigned char* data, const std::size_t size,
-               std::string& error) override {
-    return transfer(true, offset, const_cast<unsigned char*>(data), size, error);
-  }
-
-  bool readAt(const std::uint64_t offset, unsigned char* data, const std::size_t size,
-              std::string& error) override {
-    return transfer(false, offset, data, size, error);
-  }
-
-  bool flush(std::string& error) override {
-    if (fsync(descriptor_) != 0) {
-      error = errorMessage("Unable to flush the raw device", errno);
-      return false;
-    }
-    if (ioctl(descriptor_, DKIOCSYNCHRONIZECACHE) != 0) {
-      error = errorMessage("Unable to synchronize the device write cache", errno);
-      return false;
-    }
-    return true;
-  }
-
- private:
-  bool transfer(const bool writing, const std::uint64_t offset, unsigned char* data,
-                const std::size_t size, std::string& error) {
-    if (offset > capacity_ || size > capacity_ - offset ||
-        offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
-      error = "Raw-device transfer is outside the selected target";
-      return false;
-    }
-
-    std::size_t completed = 0;
-    while (completed < size) {
-      const off_t position = static_cast<off_t>(offset + completed);
-      const ssize_t count = writing
-                                ? pwrite(descriptor_, data + completed, size - completed, position)
-                                : pread(descriptor_, data + completed, size - completed, position);
-      if (count < 0 && errno == EINTR) {
-        continue;
-      }
-      if (count <= 0) {
-        error = errorMessage(writing ? "Raw-device write failed" : "Raw-device read failed",
-                             count < 0 ? errno : EIO);
-        return false;
-      }
-      completed += static_cast<std::size_t>(count);
-    }
-    return true;
-  }
-
-  int descriptor_;
-  std::uint64_t capacity_;
-  std::uint32_t sectorSize_;
-};
+using MacRawTarget = detail::SystemRawTarget;
 
 std::string cfValueToString(CFTypeRef value) {
   if (value == nullptr) {
@@ -568,6 +506,28 @@ std::string dictionaryStringProperty(const io_registry_entry_t entry, CFStringRe
     CFRelease(property);
   }
   return result;
+}
+
+std::string nearestUsbDeviceSerial(const io_registry_entry_t media) {
+  // Mass-storage drivers do not always copy the USB serial into the storage
+  // Device Characteristics dictionary. Read the closest actual USB device,
+  // stopping even when it has no serial so a hub's serial is never substituted.
+  if (IOObjectRetain(media) != KERN_SUCCESS) return {};
+  io_registry_entry_t current = media;
+  while (current != IO_OBJECT_NULL) {
+    if (IOObjectConformsTo(current, "IOUSBHostDevice") ||
+        IOObjectConformsTo(current, "IOUSBDevice")) {
+      auto serial = stringProperty(current, CFSTR("USB Serial Number"));
+      if (serial.empty()) serial = stringProperty(current, CFSTR("kUSBSerialNumberString"));
+      IOObjectRelease(current);
+      return trim(serial);
+    }
+    io_registry_entry_t parent = IO_OBJECT_NULL;
+    const auto status = IORegistryEntryGetParentEntry(current, kIOServicePlane, &parent);
+    IOObjectRelease(current);
+    current = status == KERN_SUCCESS ? parent : IO_OBJECT_NULL;
+  }
+  return {};
 }
 
 bool boolProperty(const io_registry_entry_t entry, CFStringRef key, const bool defaultValue) {
@@ -775,6 +735,9 @@ DeviceDiscoveryResult discoverBlockDevicesInternal() {
     const std::string interconnect = dictionaryStringProperty(
         media, CFSTR("Protocol Characteristics"), CFSTR("Physical Interconnect"));
     device.bus = parseBus(interconnect);
+    if (device.bus == core::DeviceBus::Usb && device.serialNumber.empty()) {
+      device.serialNumber = nearestUsbDeviceSerial(media);
+    }
 
     device.displayName = trim(device.vendor + " " + device.model);
     if (device.displayName.empty()) {
@@ -938,12 +901,9 @@ core::RawWriteResult writeRawLocallyInternal(
     result.error = "The selected target is no longer connected";
     return result;
   }
-  const core::SafetyPolicy safetyPolicy;
-  const auto identity = safetyPolicy.validateIdentity(plan.target(), *observed);
-  const auto writeSafety = safetyPolicy.validateWrite(plan.image(), *observed);
-  if (!identity.safe() || !writeSafety.safe()) {
-    result.error = !identity.safe() ? identity.issues.front().message
-                                    : writeSafety.issues.front().message;
+  const auto targetSafety = detail::validateRawWriteTarget(plan, *observed);
+  if (!targetSafety.safe()) {
+    result.error = targetSafety.issues.front().message;
     return result;
   }
 
@@ -993,7 +953,7 @@ core::RawWriteResult writeRawLocallyInternal(
     result.error = "The target disappeared after it was unmounted";
     return result;
   }
-  const auto finalIdentity = safetyPolicy.validateIdentity(plan.target(), *reobserved);
+  const auto finalIdentity = detail::validateRawWriteTarget(plan, *reobserved);
   if (!finalIdentity.safe()) {
     result.error = finalIdentity.issues.front().message;
     return result;
@@ -1046,8 +1006,18 @@ core::RawWriteResult writeRawLocallyInternal(
   static_cast<void>(fcntl(descriptor.get(), F_NOCACHE, 1));
   MacRawTarget rawTarget(descriptor.get(), capacity, sectorSize);
   const core::RawImageWriter writer;
-  return source == nullptr ? writer.write(plan, rawTarget, onProgress, isCancelled)
-                           : writer.write(plan, *source, rawTarget, onProgress, isCancelled);
+  return detail::finishNativeWrite(plan,
+      [&](const auto& progress) {
+        return source == nullptr ? writer.write(plan, rawTarget, progress, isCancelled)
+                                 : writer.write(plan, *source, rawTarget, progress, isCancelled);
+      }, [&](std::string& error) {
+        const auto safety = core::WritePlanBuilder::validateSource(plan);
+        if (!safety.safe()) {
+          error = safety.issues.front().message;
+          return false;
+        }
+        return true;
+      }, onProgress);
 }
 
 core::BadBlockTestResult testBadBlocksLocallyInternal(
