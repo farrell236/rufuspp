@@ -20,6 +20,6 @@ jobs:
     uses: ./.github/workflows/package-build.yml
     with:
       build_type: ${{ inputs.configuration }}
-      version: 0.2.0-dev.${{ github.run_number }}
+      version: 0.2.1-dev.${{ github.run_number }}
       retention_days: 14
 

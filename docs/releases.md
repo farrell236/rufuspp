@@ -35,6 +35,12 @@ notice. After checking all four packages, publish the draft to make the website'
 download links and changelog pick it up automatically. The website includes
 published prereleases and excludes drafts.
 
+The current patch release is **0.2.1**, retaining the field-testing preview
+designation. Its [release notes](release-notes/0.2.1.md) describe the portable
+VHDX capture fix, independent decoder regression and physical capture/restore
+results, including the unresolved macOS disk-interface issue. Linux CI installs
+`qemu-utils` so the independent capture test runs during package validation.
+
 macOS/Linux packages built from this updated source include the statically linked
 NTFS library, a private `rufus-mkntfs` next to the executable, and the bundled source/licenses. They do
 not install macFUSE or a host NTFS driver. Windows retains native DiskPart for

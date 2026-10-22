@@ -18,7 +18,7 @@ may differ by host, installed dependencies, detected image, target geometry,
 and Windows version. Native styling also varies slightly between operating
 systems.
 
-These instructions describe Rufus++ 0.2.0. See the [release notes](release-notes/0.2.0.md)
+These instructions describe Rufus++ 0.2.1. See the [release notes](release-notes/0.2.1.md)
 for changes and the [release workflow](releases.md) for package details.
 
 ## Contents
@@ -445,6 +445,18 @@ only capture providers available for the current platform and source:
 Capture never overwrites an existing destination. The source is read through a
 guarded transport, the new image is verified, and source changes or I/O errors
 reject the result.
+
+Version 0.2.1 fixes VHDX capture headers that independent readers such as QEMU
+rejected. Existing captures are not modified by an upgrade; recapture the source
+with 0.2.1 to produce the corrected VHDX layout.
+
+Physical DD, fixed/dynamic VHD and VHDX round trips passed full readback on the
+tested macOS/Kingston route. Some completed writes required reconnecting the
+USB before independent verification because macOS stopped exposing its disk
+interface. That operational issue remains unresolved; these results do not
+establish uninterrupted operation. See the
+[capture/restore test record](write-testing.md#physical-dummy-file-capturerestore-qualification)
+for the exact coverage and recovery procedure.
 
 ### Image checksums
 

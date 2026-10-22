@@ -52,7 +52,7 @@ jobs:
 
       - name: Install compression libraries (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libbz2-dev liblzma-dev libzstd-dev
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libbz2-dev liblzma-dev libzstd-dev qemu-utils
 
       - name: Install compression libraries (macOS)
         if: runner.os == 'macOS'

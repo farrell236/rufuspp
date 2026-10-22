@@ -211,6 +211,7 @@ bool makeVhdxLayout(const std::uint64_t virtualBytes,
   constexpr std::uint64_t metadataOffset = mebibyte;
   constexpr std::uint32_t metadataLength = 1024U * 1024U;
   constexpr std::uint64_t batOffset = 2U * mebibyte;
+  constexpr std::uint32_t logLength = 1024U * 1024U;
   const std::uint64_t blockCount =
       (virtualBytes - 1U) / kDynamicBlockBytes + 1U;
   const std::uint64_t chunkRatio =
@@ -231,13 +232,17 @@ bool makeVhdxLayout(const std::uint64_t virtualBytes,
       std::max<std::uint64_t>(mebibyte,
                               (batBytes + mebibyte - 1U) / mebibyte * mebibyte);
   if (alignedBatBytes > std::numeric_limits<std::uint32_t>::max() ||
-      batOffset > std::numeric_limits<std::uint64_t>::max() - alignedBatBytes) {
+      batOffset > std::numeric_limits<std::uint64_t>::max() - alignedBatBytes - logLength) {
     error = "The VHDX allocation table is too large";
     return false;
   }
   layout.batOffset = batOffset;
   layout.batLength = static_cast<std::uint32_t>(alignedBatBytes);
-  layout.payloadOffset = batOffset + alignedBatBytes;
+  // Even a clean, newly created VHDX must locate its log after the
+  // 1-MiB header section. Reserve an empty non-overlapping log so other
+  // implementations can open the file; a zero LogGuid means no replay.
+  const std::uint64_t logOffset = batOffset + alignedBatBytes;
+  layout.payloadOffset = logOffset + logLength;
   if (layout.payloadOffset > std::numeric_limits<std::size_t>::max()) {
     error = "The VHDX metadata prefix is too large for this host";
     return false;
@@ -262,6 +267,8 @@ bool makeVhdxLayout(const std::uint64_t virtualBytes,
     std::copy(fileWrite.begin(), fileWrite.end(), header + 16U);
     std::copy(dataWrite.begin(), dataWrite.end(), header + 32U);
     putLittle16(header + 66U, 1U);
+    putLittle32(header + 68U, logLength);
+    putLittle64(header + 72U, logOffset);
     putLittle32(header + 4U, crc32c(header, 4096U));
   };
   writeHeader(64U * 1024U, 1U);

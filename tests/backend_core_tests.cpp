@@ -230,7 +230,7 @@ void writeBytes(const std::filesystem::path& path, const std::vector<unsigned ch
   expect(static_cast<bool>(output), "test fixture should be written");
 }
 
-void testMediaCapture(const TemporaryDirectory& temporary) {
+void testMediaCapture(const std::filesystem::path& directory) {
   std::vector<unsigned char> bytes(4U * 1024U * 1024U, 0);
   for (std::size_t index = 0; index < 4096U; ++index) {
     bytes[index] = static_cast<unsigned char>((index * 37U) & 0xffU);
@@ -248,7 +248,7 @@ void testMediaCapture(const TemporaryDirectory& temporary) {
       }};
   for (const auto& [format, name] : formats) {
     MemoryRawSource source(bytes);
-    const auto destination = temporary.path() / name;
+    const auto destination = directory / name;
     std::size_t progressEvents = 0;
     const auto captured = writer.capture(
         source, destination, {format, 64U * 1024U, true},
@@ -270,10 +270,34 @@ void testMediaCapture(const TemporaryDirectory& temporary) {
                observed == bytes,
            std::string("captured virtual disk should reproduce source bytes: ") +
                error);
+    if (format == rufus::core::MediaCaptureFormat::DynamicVhdx) {
+      const auto little = [](const unsigned char* value, const unsigned int count) {
+        std::uint64_t result = 0U;
+        for (unsigned int index = 0; index < count; ++index) {
+          result |= static_cast<std::uint64_t>(value[index]) << (index * 8U);
+        }
+        return result;
+      };
+      std::ifstream input(destination, std::ios::binary);
+      for (const auto offset : {65536U, 131072U}) {
+        std::array<unsigned char, 80> header{};
+        input.seekg(offset);
+        input.read(reinterpret_cast<char*>(header.data()), header.size());
+        const auto logLength = little(header.data() + 68U, 4U);
+        const auto logOffset = little(header.data() + 72U, 8U);
+        expect(input && logLength >= 1024U * 1024U &&
+                   logLength % (1024U * 1024U) == 0U && logOffset >= 1024U * 1024U &&
+                   logOffset % (1024U * 1024U) == 0U &&
+                   logOffset + logLength <= std::filesystem::file_size(destination) &&
+                   std::all_of(header.begin() + 48U, header.begin() + 64U,
+                               [](const auto byte) { return byte == 0U; }),
+               "both VHDX headers must declare an aligned empty log after the header section");
+      }
+    }
   }
 
   MemoryRawSource cancelledSource(bytes);
-  const auto cancelledPath = temporary.path() / "cancelled-capture.img";
+  const auto cancelledPath = directory / "cancelled-capture.img";
   bool stop = false;
   const auto cancelled = writer.capture(
       cancelledSource, cancelledPath,
@@ -3149,14 +3173,23 @@ void testLinuxPersistence(const TemporaryDirectory& temporary) {
 
 }  // namespace
 
-int main() {
+int main(const int argc, const char* const argv[]) {
+  if (argc == 3 && std::string(argv[1]) == "--capture-fixtures") {
+    const auto directory = std::filesystem::absolute(std::filesystem::u8path(argv[2]));
+    expect(!std::filesystem::is_symlink(directory) &&
+               std::filesystem::create_directory(directory),
+           "capture fixtures require a new private ordinary directory");
+    testMediaCapture(directory);
+    return EXIT_SUCCESS;
+  }
+  expect(argc == 1, "unexpected test arguments");
   const TemporaryDirectory temporary;
   testMediaPolicy();
   testImageAnalysis(temporary);
   testWindowsToGoPlanning(temporary);
   testImageProfiles();
   testFileWriter(temporary);
-  testMediaCapture(temporary);
+  testMediaCapture(temporary.path());
   testBadBlockEngine();
   testStandaloneFat32(temporary);
   testRawWritePlanAndEngine(temporary);
