@@ -61,10 +61,23 @@ ExternalProject_Add(rufus_ntfs_upstream
                    "${ntfs_build}/ntfsprogs/mkntfs"
   LOG_CONFIGURE TRUE LOG_BUILD TRUE LOG_OUTPUT_ON_FAILURE TRUE
 )
+# Give the exact upstream headers and generated ABI configuration a private
+# include namespace. Generic names such as unistr.h also exist in Homebrew.
+set(ntfs_header_root "${CMAKE_CURRENT_BINARY_DIR}/include")
+set(ntfs_headers "${ntfs_header_root}/rufuspp_bundled_ntfs")
+file(MAKE_DIRECTORY "${ntfs_headers}")
+ExternalProject_Add_Step(rufus_ntfs_upstream bundle_headers
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+    "${ntfs_source}/include/ntfs-3g" "${ntfs_headers}"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${ntfs_build}/config.h" "${ntfs_headers}/config.h"
+  DEPENDEES configure
+  DEPENDERS build
+)
 add_library(rufus_bundled_ntfs STATIC IMPORTED GLOBAL)
 set_target_properties(rufus_bundled_ntfs PROPERTIES
   IMPORTED_LOCATION "${ntfs_build}/libntfs-3g/.libs/libntfs-3g.a"
-  INTERFACE_INCLUDE_DIRECTORIES "${ntfs_source}/include/ntfs-3g"
+  INTERFACE_INCLUDE_DIRECTORIES "${ntfs_header_root}"
 )
 add_dependencies(rufus_bundled_ntfs rufus_ntfs_upstream)
 add_library(RufusPlusPlus::BundledNtfs ALIAS rufus_bundled_ntfs)

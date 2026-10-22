@@ -21,5 +21,8 @@ script, retains the original archive, and needs no Autoconf/Automake installatio
 Optional libhd/libuuid integrations are also disabled to avoid host dependencies.
 The unused libintl header check is disabled too, preventing host gettext headers
 from remapping `setlocale` to an unbundled library on Intel macOS.
+The build copies the upstream headers and their generated ABI configuration
+into a private `rufuspp_bundled_ntfs` include namespace, avoiding collisions with
+unrelated host headers such as Homebrew's `unistr.h`.
 The library/formatter source files carry their individual notices (principally
 GPL-2.0-or-later); preserve COPYING and COPYING.LIB from the upstream archive.

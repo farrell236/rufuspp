@@ -32,7 +32,6 @@ if(UNIX)
   find_package(Threads REQUIRED)
   target_sources(rufus_plus_plus_platform_backend PRIVATE src/ntfs_file_tree.cpp src/bundled_ntfs_tools.cpp)
   target_link_libraries(rufus_plus_plus_platform_backend PRIVATE RufusPlusPlus::BundledNtfs Threads::Threads)
-  target_include_directories(rufus_plus_plus_platform_backend SYSTEM PRIVATE "${RUFUSPP_NTFS_BUILD_DIR}")
   add_dependencies(rufus_plus_plus_platform_backend rufus_ntfs_upstream)
 endif()
 

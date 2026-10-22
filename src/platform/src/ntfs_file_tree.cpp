@@ -15,10 +15,10 @@
 // Use the exact ABI configuration that built the bundled C library.
 #define HAVE_CONFIG_H 1
 extern "C" {
-#include "volume.h"
-#include "dir.h"
-#include "unistr.h"
-#include "endians.h"
+#include <rufuspp_bundled_ntfs/volume.h>
+#include <rufuspp_bundled_ntfs/dir.h>
+#include <rufuspp_bundled_ntfs/unistr.h>
+#include <rufuspp_bundled_ntfs/endians.h>
 }
 #undef min
 #undef max
