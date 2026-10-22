@@ -63,6 +63,11 @@ class CommandTests(unittest.TestCase):
         self.media, self.code, self.variables = [self.root / name for name in ("usb.img", "code.fd", "vars.fd")]
         for path in (self.media, self.code, self.variables):
             path.write_bytes(bytes(512))
+        # Every command-only test uses private firmware, including the direct
+        # USB launcher paths. No Homebrew/QEMU installation is needed in CI.
+        firmware = patch.object(boot, "CODE", self.code)
+        firmware.start()
+        self.addCleanup(firmware.stop)
 
     def command(self, smoke=False):
         with patch.object(boot, "CODE", self.code):

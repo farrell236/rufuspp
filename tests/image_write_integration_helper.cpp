@@ -143,10 +143,14 @@ void writeImage(const std::filesystem::path& source, const std::filesystem::path
   checkPath(destination);
   const auto analysis = ImageAnalyzer{}.analyze(source);
   check(analysis.succeeded(), "analyze source image");
+  // Select before moving ranges: function-argument evaluation order differs
+  // between compilers, and a moved-from vector may already appear empty.
+  const auto verification =
+      analysis.image->deploymentSizeBytes() == capacity && ranges.empty()
+          ? VerificationProfile::Full : VerificationProfile::Standard;
   const auto plan = WritePlanBuilder{}.buildRawWriteWithVerification(
       *analysis.image, descriptor(destination, capacity, static_cast<std::uint32_t>(sector)),
-      analysis.image->deploymentSizeBytes() == capacity && ranges.empty() ? VerificationProfile::Full
-                                                       : VerificationProfile::Standard,
+      verification,
       static_cast<std::size_t>(blockSize), clearTail, std::move(ranges));
   check(plan.succeeded(), "build regular-file image test plan");
   NewFile file(destination);

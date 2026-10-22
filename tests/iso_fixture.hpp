@@ -94,7 +94,7 @@ inline void writeIsoFixture(const std::filesystem::path& path, const bool corrup
   auto asciiName = [](const std::string& value) {
     return std::vector<unsigned char>(value.begin(), value.end());
   };
-  auto writeDirectory = [&directoryRecord, &asciiName](
+  auto writeDirectory = [&](
                             const std::size_t sector, const std::size_t parentSector,
                             const std::vector<std::tuple<std::string, std::uint32_t,
                                                          std::uint32_t, unsigned char>>& entries) {
