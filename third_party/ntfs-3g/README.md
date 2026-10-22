@@ -19,5 +19,7 @@ The CMake build makes upstream's unconditional pkg-config requirement optional
 when both FUSE and crypto are disabled. It changes only the extracted configure
 script, retains the original archive, and needs no Autoconf/Automake installation.
 Optional libhd/libuuid integrations are also disabled to avoid host dependencies.
+The unused libintl header check is disabled too, preventing host gettext headers
+from remapping `setlocale` to an unbundled library on Intel macOS.
 The library/formatter source files carry their individual notices (principally
 GPL-2.0-or-later); preserve COPYING and COPYING.LIB from the upstream archive.
