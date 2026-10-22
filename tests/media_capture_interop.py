@@ -16,6 +16,15 @@ def command(args):
     return result.stdout
 
 
+def image_options(path, fmt):
+    options = {"driver": fmt, "file": {"driver": "file", "filename": str(path)}}
+    if fmt == "vpc":
+        # Older QEMU defaults unknown VHD creators to rounded CHS geometry.
+        # These captures preserve current_size exactly, as Hyper-V does.
+        options["force_size_calc"] = "current_size"
+    return "json:" + json.dumps(options)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--helper", type=Path, required=True)
@@ -29,9 +38,10 @@ def main():
                               ("captured-dynamic.vhd", "vpc"),
                               ("captured-dynamic.vhdx", "vhdx")):
             capture = directory / filename
-            info = json.loads(command([args.qemu_img, "info", "--output=json", "-f", fmt, capture]))
-            assert info["virtual-size"] == baseline.stat().st_size
-            command([args.qemu_img, "compare", "-f", "raw", "-F", fmt, baseline, capture])
+            image = image_options(capture, fmt)
+            info = json.loads(command([args.qemu_img, "info", "--output=json", image]))
+            assert info["virtual-size"] == baseline.stat().st_size, (filename, info)
+            command([args.qemu_img, "compare", image_options(baseline, "raw"), image])
         vhdx = directory / "captured-dynamic.vhdx"
         with vhdx.open("rb") as stream:
             for offset in (65536, 131072):
