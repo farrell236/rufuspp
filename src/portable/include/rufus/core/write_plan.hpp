@@ -19,6 +19,7 @@
 
 #include "rufus/core/media.hpp"
 #include "rufus/core/safety_policy.hpp"
+#include "rufus/core/write_range.hpp"
 
 namespace rufus::core {
 
@@ -36,8 +37,15 @@ class RawWritePlan final {
  public:
   [[nodiscard]] const ImageInfo& image() const noexcept { return image_; }
   [[nodiscard]] const BlockDeviceInfo& target() const noexcept { return target_; }
+  // Transfer count, which may be smaller than the source's logical size.
   [[nodiscard]] std::uint64_t bytesToWrite() const noexcept {
-    return image_.deploymentSizeBytes();
+    return bytesToWrite_;
+  }
+  [[nodiscard]] const std::vector<RawWriteRange>& writeRanges() const noexcept {
+    return writeRanges_;
+  }
+  [[nodiscard]] bool writesWholeImage() const noexcept {
+    return bytesToWrite_ == image_.deploymentSizeBytes();
   }
   [[nodiscard]] std::size_t blockSize() const noexcept { return blockSize_; }
   [[nodiscard]] bool verify() const noexcept {
@@ -59,13 +67,16 @@ class RawWritePlan final {
   RawWritePlan(ImageInfo image, BlockDeviceInfo target, std::size_t blockSize,
                VerificationProfile verificationProfile,
                bool clearTargetTailMetadata,
-               std::filesystem::file_time_type sourceLastWriteTime)
+               std::filesystem::file_time_type sourceLastWriteTime,
+               std::vector<RawWriteRange> writeRanges,
+               std::uint64_t bytesToWrite)
       : image_(std::move(image)),
         target_(std::move(target)),
         blockSize_(blockSize),
         verificationProfile_(verificationProfile),
         clearTargetTailMetadata_(clearTargetTailMetadata),
-        sourceLastWriteTime_(sourceLastWriteTime) {}
+        sourceLastWriteTime_(sourceLastWriteTime),
+        writeRanges_(std::move(writeRanges)), bytesToWrite_(bytesToWrite) {}
 
   ImageInfo image_;
   BlockDeviceInfo target_;
@@ -73,6 +84,8 @@ class RawWritePlan final {
   VerificationProfile verificationProfile_{VerificationProfile::Standard};
   bool clearTargetTailMetadata_{};
   std::filesystem::file_time_type sourceLastWriteTime_{};
+  std::vector<RawWriteRange> writeRanges_;
+  std::uint64_t bytesToWrite_{};
 };
 
 struct RawWritePlanResult final {
@@ -93,7 +106,9 @@ class WritePlanBuilder final {
       const ImageInfo& image, const BlockDeviceInfo& target,
       VerificationProfile verificationProfile,
       std::size_t blockSize = 4U * 1024U * 1024U,
-      bool clearTargetTailMetadata = false) const;
+      bool clearTargetTailMetadata = false,
+      // Only formatter-authored, ordinary raw images may omit unused ranges.
+      std::vector<RawWriteRange> writeRanges = {}) const;
 
   [[nodiscard]] static SafetyCheckResult validateSource(const RawWritePlan& plan);
 };

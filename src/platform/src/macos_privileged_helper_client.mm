@@ -25,6 +25,7 @@
 #include <string>
 
 #include "macos_privileged_helper_protocol.hpp"
+#include "macos_write_ranges.hpp"
 
 namespace rufus::backend::macos {
 
@@ -238,6 +239,8 @@ core::RawWriteResult writeRawWithPrivilegedHelper(
       static_cast<std::uint64_t>(plan.verificationProfile()));
   xpc_dictionary_set_bool(request, wire::kClearTargetTailMetadata,
                           plan.clearTargetTailMetadata());
+  wire::encodeWriteRanges(request, plan.writesWholeImage()
+      ? std::vector<core::RawWriteRange>{} : plan.writeRanges());
 
   xpc_connection_send_message_with_reply(connection, request, queue, ^(xpc_object_t reply) {
     if (xpc_get_type(reply) == XPC_TYPE_ERROR) {

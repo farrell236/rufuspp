@@ -3,9 +3,23 @@ add_library(rufus_plus_plus_platform_backend STATIC
   src/read_only_media_inspector.cpp
   src/standalone_filesystem_stager.cpp
   src/windows_to_go_image_stager.cpp
+  src/ntfs_bootstrap.cpp
 )
 
 add_library(RufusPlusPlus::PlatformBackend ALIAS rufus_plus_plus_platform_backend)
+
+# The unmodified, GPL ms-sys tables are pinned together with their source.
+foreach(boot_table IN ITEMS br_ntfs_0x0 br_ntfs_0x54)
+  file(SHA256 "${PROJECT_SOURCE_DIR}/third_party/windows-ntfs-boot/${boot_table}.h" boot_sha256)
+  if(boot_table STREQUAL "br_ntfs_0x0")
+    set(expected_boot_sha256 "66fdf077a5e265b829de0040d714634ea732c48bc8e0d131e7cab7b0dde8c6e5")
+  else()
+    set(expected_boot_sha256 "258cafd9f0f6c1924e0e6f67b775c5466f3accaadae2b80381a18eac39f807d3")
+  endif()
+  if(NOT boot_sha256 STREQUAL expected_boot_sha256)
+    message(FATAL_ERROR "Windows NTFS boot table checksum mismatch: ${boot_table}")
+  endif()
+endforeach()
 
 target_include_directories(rufus_plus_plus_platform_backend
   PUBLIC
@@ -14,6 +28,13 @@ target_include_directories(rufus_plus_plus_platform_backend
 
 target_compile_features(rufus_plus_plus_platform_backend PUBLIC cxx_std_17)
 target_link_libraries(rufus_plus_plus_platform_backend PUBLIC RufusPlusPlus::PortableCore)
+if(UNIX)
+  find_package(Threads REQUIRED)
+  target_sources(rufus_plus_plus_platform_backend PRIVATE src/ntfs_file_tree.cpp src/bundled_ntfs_tools.cpp)
+  target_link_libraries(rufus_plus_plus_platform_backend PRIVATE RufusPlusPlus::BundledNtfs Threads::Threads)
+  target_include_directories(rufus_plus_plus_platform_backend SYSTEM PRIVATE "${RUFUSPP_NTFS_BUILD_DIR}")
+  add_dependencies(rufus_plus_plus_platform_backend rufus_ntfs_upstream)
+endif()
 
 if(APPLE)
   target_sources(rufus_plus_plus_platform_backend PRIVATE

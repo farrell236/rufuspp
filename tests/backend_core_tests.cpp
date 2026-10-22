@@ -8,6 +8,8 @@
  * (at your option) any later version.
  */
 
+#include "iso_fixture.hpp"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -40,6 +42,7 @@
 #include "rufus/core/windows_to_go.hpp"
 #include "rufus/core/write_plan.hpp"
 #include "linux_persistence_support.hpp"
+#include "ext2_formatter.hpp"
 
 namespace {
 
@@ -594,171 +597,7 @@ void testStandaloneFat32(const TemporaryDirectory& temporary) {
          "the standalone ext2 partition should contain the ext2 superblock magic");
 }
 
-void writeIsoFixture(const std::filesystem::path& path, const bool corruptBootCatalog = false,
-                     const bool corruptWim = false,
-                     const bool useInstallEsd = false) {
-  constexpr std::uint32_t sectorSize = 2048;
-  std::vector<unsigned char> bytes(28 * sectorSize, 0);
-
-  auto writeBothEndian32 = [&bytes](const std::size_t offset, const std::uint32_t value) {
-    bytes[offset] = static_cast<unsigned char>(value & 0xffU);
-    bytes[offset + 1] = static_cast<unsigned char>((value >> 8U) & 0xffU);
-    bytes[offset + 2] = static_cast<unsigned char>((value >> 16U) & 0xffU);
-    bytes[offset + 3] = static_cast<unsigned char>((value >> 24U) & 0xffU);
-    bytes[offset + 4] = static_cast<unsigned char>((value >> 24U) & 0xffU);
-    bytes[offset + 5] = static_cast<unsigned char>((value >> 16U) & 0xffU);
-    bytes[offset + 6] = static_cast<unsigned char>((value >> 8U) & 0xffU);
-    bytes[offset + 7] = static_cast<unsigned char>(value & 0xffU);
-  };
-
-  auto writeBothEndian16 = [&bytes](const std::size_t offset, const std::uint16_t value) {
-    bytes[offset] = static_cast<unsigned char>(value & 0xffU);
-    bytes[offset + 1] = static_cast<unsigned char>((value >> 8U) & 0xffU);
-    bytes[offset + 2] = static_cast<unsigned char>((value >> 8U) & 0xffU);
-    bytes[offset + 3] = static_cast<unsigned char>(value & 0xffU);
-  };
-
-  auto writeLittleEndian16 = [&bytes](const std::size_t offset, const std::uint16_t value) {
-    bytes[offset] = static_cast<unsigned char>(value & 0xffU);
-    bytes[offset + 1] = static_cast<unsigned char>((value >> 8U) & 0xffU);
-  };
-
-  auto writeLittleEndian32 = [&bytes](const std::size_t offset, const std::uint32_t value) {
-    for (unsigned int index = 0; index < 4; ++index) {
-      bytes[offset + index] = static_cast<unsigned char>((value >> (index * 8U)) & 0xffU);
-    }
-  };
-
-  auto writeLittleEndian64 = [&bytes](const std::size_t offset, const std::uint64_t value) {
-    for (unsigned int index = 0; index < 8; ++index) {
-      bytes[offset + index] = static_cast<unsigned char>((value >> (index * 8U)) & 0xffU);
-    }
-  };
-
-  auto directoryRecord = [&bytes, &writeBothEndian32](
-                             const std::size_t offset, const std::uint32_t extent,
-                             const std::uint32_t size, const unsigned char flags,
-                             const std::vector<unsigned char>& name) {
-    const std::size_t padding = name.size() % 2U == 0 ? 1U : 0U;
-    const std::size_t length = 33U + name.size() + padding;
-    bytes[offset] = static_cast<unsigned char>(length);
-    writeBothEndian32(offset + 2, extent);
-    writeBothEndian32(offset + 10, size);
-    bytes[offset + 25] = flags;
-    bytes[offset + 28] = 1;
-    bytes[offset + 31] = 1;
-    bytes[offset + 32] = static_cast<unsigned char>(name.size());
-    std::copy(name.begin(), name.end(), bytes.begin() + static_cast<std::ptrdiff_t>(offset + 33));
-    return length;
-  };
-
-  auto descriptor = [&](const std::size_t sector, const unsigned char type) {
-    const std::size_t offset = sector * sectorSize;
-    bytes[offset] = type;
-    bytes[offset + 1] = 'C';
-    bytes[offset + 2] = 'D';
-    bytes[offset + 3] = '0';
-    bytes[offset + 4] = '0';
-    bytes[offset + 5] = '1';
-    bytes[offset + 6] = 1;
-    return offset;
-  };
-
-  const std::size_t boot = descriptor(16, 0);
-  const std::string bootSystem = "EL TORITO SPECIFICATION";
-  std::copy(bootSystem.begin(), bootSystem.end(),
-            bytes.begin() + static_cast<std::ptrdiff_t>(boot + 7));
-  bytes[boot + 71] = 26;
-  const std::size_t primary = descriptor(17, 1);
-  const std::string label = "RUFUSPP_QT_TEST";
-  std::copy(label.begin(), label.end(), bytes.begin() + static_cast<std::ptrdiff_t>(primary + 40));
-  writeBothEndian16(primary + 128, sectorSize);
-  directoryRecord(primary + 156, 19, sectorSize, 0x02, {0});
-  descriptor(18, 255);
-
-  auto asciiName = [](const std::string& value) {
-    return std::vector<unsigned char>(value.begin(), value.end());
-  };
-  auto writeDirectory = [&directoryRecord, &asciiName, sectorSize](
-                            const std::size_t sector, const std::size_t parentSector,
-                            const std::vector<std::tuple<std::string, std::uint32_t,
-                                                         std::uint32_t, unsigned char>>& entries) {
-    std::size_t offset = sector * sectorSize;
-    offset += directoryRecord(offset, static_cast<std::uint32_t>(sector), sectorSize, 0x02, {0});
-    offset += directoryRecord(offset, static_cast<std::uint32_t>(parentSector), sectorSize,
-                              0x02, {1});
-    for (const auto& [name, extent, size, flags] : entries) {
-      offset += directoryRecord(offset, extent, size, flags, asciiName(name));
-    }
-  };
-
-  writeDirectory(19, 19,
-                 {{"BOOTMGR;1", 20, 4, 0},
-                  {"SOURCES", 21, sectorSize, 0x02},
-                  {"EFI", 23, sectorSize, 0x02}});
-  const std::string wimXml =
-      "<WIM><IMAGE INDEX=\"1\"><NAME>Windows Test</NAME>"
-      "<DISPLAYNAME>Windows 11 Test &amp; Tools</DISPLAYNAME>"
-      "<DESCRIPTION>Test edition metadata</DESCRIPTION><TOTALBYTES>7516192768</TOTALBYTES>"
-      "<WINDOWS><ARCH>9</ARCH>"
-      "<VERSION><MAJOR>10</MAJOR><MINOR>0</MINOR><BUILD>22621</BUILD></VERSION>"
-      "</WINDOWS></IMAGE></WIM>";
-  const std::uint32_t wimSize =
-      static_cast<std::uint32_t>(208U + 2U + wimXml.size() * 2U);
-  writeDirectory(21, 19,
-                 {{useInstallEsd ? "INSTALL.ESD;1" : "INSTALL.WIM;1",
-                   22, wimSize, 0}});
-  writeDirectory(23, 19, {{"BOOT", 24, sectorSize, 0x02}});
-  writeDirectory(24, 23, {{"BOOTX64.EFI;1", 25, 4, 0}});
-  for (const std::size_t sector : {20U, 25U}) {
-    bytes[sector * sectorSize] = 't';
-    bytes[sector * sectorSize + 1] = 'e';
-    bytes[sector * sectorSize + 2] = 's';
-    bytes[sector * sectorSize + 3] = 't';
-  }
-
-  const std::size_t wim = 22 * sectorSize;
-  const std::string wimMagic{"MSWIM\0\0\0", 8};
-  std::copy(wimMagic.begin(), wimMagic.end(),
-            bytes.begin() + static_cast<std::ptrdiff_t>(wim));
-  writeLittleEndian32(wim + 8, 208);
-  writeLittleEndian32(wim + 12, 0x00010d00U);
-  writeLittleEndian16(wim + 40, 1);
-  writeLittleEndian16(wim + 42, 1);
-  writeLittleEndian32(wim + 44, 1);
-  const std::uint64_t xmlSize = 2U + wimXml.size() * 2U;
-  for (unsigned int index = 0; index < 7; ++index) {
-    bytes[wim + 72 + index] =
-        static_cast<unsigned char>((xmlSize >> (index * 8U)) & 0xffU);
-  }
-  bytes[wim + 79] = 0x02;
-  writeLittleEndian64(wim + 80, 208);
-  writeLittleEndian64(wim + 88, xmlSize);
-  writeLittleEndian32(wim + 120, 1);
-  bytes[wim + 208] = 0xff;
-  bytes[wim + 209] = 0xfe;
-  for (std::size_t index = 0; index < wimXml.size(); ++index) {
-    bytes[wim + 210 + index * 2U] = static_cast<unsigned char>(wimXml[index]);
-  }
-  if (corruptWim) {
-    bytes[wim] = 'X';
-  }
-
-  const std::size_t catalog = 26 * sectorSize;
-  bytes[catalog] = 1;
-  bytes[catalog + 28] = 0xaa;
-  bytes[catalog + 29] = 0x55;
-  bytes[catalog + 30] = 0x55;
-  bytes[catalog + 31] = 0xaa;
-  bytes[catalog + 32] = 0x88;
-  bytes[catalog + 38] = 4;
-  bytes[catalog + 40] = 27;
-  bytes[27 * sectorSize] = 0xeb;
-  if (corruptBootCatalog) {
-    bytes[catalog + 28] ^= 1U;
-  }
-  writeBytes(path, bytes);
-}
+using rufus::tests::writeIsoFixture;
 
 enum class GrubFixtureLayout { BootGrub, BootGrub2, RootGrub };
 enum class LinuxFixturePersistence { Casper, DebianLive, Unsupported };
@@ -2212,6 +2051,11 @@ void testDeploymentQuality(const TemporaryDirectory& temporary) {
                  std::string::npos &&
              report.toJson().find("\"ready\":true") != std::string::npos,
          "a valid deployment should produce a ready, serializable preflight report");
+  input.writeSizePending = true;
+  expect(rufus::core::buildDeploymentPreflight(input).toText().find(
+             "Calculated during preparation") != std::string::npos,
+         "range-write preflight must not present logical disk capacity as transferred bytes");
+  input.writeSizePending = false;
 
   input.dependencies.push_back(
       {"missing required provider", true, false, "Not installed"});
@@ -2384,6 +2228,57 @@ std::uint32_t readLittle32(const unsigned char* bytes) {
   return value;
 }
 
+void checkFatDirectoryParents(const std::filesystem::path& path) {
+  std::ifstream input(path, std::ios::binary);
+  constexpr std::uint64_t partitionOffset = 2048ULL * 512ULL;
+  std::array<unsigned char, 512> boot{};
+  input.seekg(static_cast<std::streamoff>(partitionOffset));
+  input.read(reinterpret_cast<char*>(boot.data()), boot.size());
+  expect(input && readLittle16(boot.data() + 11) == 512U,
+         "directory parent test requires the staged FAT32 partition");
+  const std::uint32_t root = readLittle32(boot.data() + 44);
+  const std::uint64_t dataStart = partitionOffset +
+      (readLittle16(boot.data() + 14) +
+       static_cast<std::uint64_t>(boot[16]) * readLittle32(boot.data() + 36)) * 512ULL;
+  const std::size_t clusterBytes = static_cast<std::size_t>(boot[13]) * 512U;
+  auto entryCluster = [](const unsigned char* entry) {
+    return static_cast<std::uint32_t>(readLittle16(entry + 20)) << 16U |
+           readLittle16(entry + 26);
+  };
+  std::vector<std::pair<std::uint32_t, std::uint32_t>> pending{{root, 0U}};
+  std::size_t rootChildren = 0U, nestedChildren = 0U;
+  for (std::size_t index = 0U; index < pending.size(); ++index) {
+    expect(pending.size() <= 16U, "fixture directory traversal must remain bounded");
+    const auto [cluster, parent] = pending[index];
+    std::vector<unsigned char> directory(clusterBytes);
+    input.seekg(static_cast<std::streamoff>(dataStart +
+        static_cast<std::uint64_t>(cluster - 2U) * clusterBytes));
+    input.read(reinterpret_cast<char*>(directory.data()), directory.size());
+    expect(static_cast<bool>(input), "fixture directory cluster must be readable");
+    if (index != 0U) {
+      expect(directory[0] == '.' && directory[1] == ' ' &&
+                 entryCluster(directory.data()) == cluster,
+             "FAT dot entry must point to its own directory");
+      expect(directory[32] == '.' && directory[33] == '.' && directory[34] == ' ' &&
+                 entryCluster(directory.data() + 32) == parent,
+             "FAT dotdot entry must use zero for root and the actual cluster for nested parents");
+      if (parent == 0U) ++rootChildren;
+      else ++nestedChildren;
+    }
+    for (std::size_t offset = 0U; offset + 32U <= directory.size(); offset += 32U) {
+      const auto* entry = directory.data() + offset;
+      if (entry[0] == 0U) break;
+      if (entry[0] == 0xe5U || entry[0] == '.' || entry[11] == 0x0fU ||
+          (entry[11] & 0x10U) == 0U) continue;
+      const auto child = entryCluster(entry);
+      expect(child >= 2U, "fixture child directory must have a valid cluster");
+      pending.emplace_back(child, index == 0U ? 0U : cluster);
+    }
+  }
+  expect(rootChildren >= 2U && nestedChildren >= 1U,
+         "parent-pointer regression must cover both root and nested directories");
+}
+
 void testIsoModeDeployment(const TemporaryDirectory& temporary) {
   const auto sourcePath = temporary.path() / "deploy.iso";
   writeIsoFixture(sourcePath);
@@ -2417,6 +2312,7 @@ void testIsoModeDeployment(const TemporaryDirectory& temporary) {
       [&](const rufus::core::IsoDeploymentProgress&) { ++progressEvents; });
   expect(staged.success && staged.stagedImage.has_value(),
          "ISO files should stage into a verified FAT32 image: " + staged.error);
+  checkFatDirectoryParents(outputPath);
   expect(staged.filesExtracted == 3 && staged.bytesExtracted > 0,
          "ISO staging should extract every fixture file");
   expect(progressEvents >= 8, "ISO staging should report each major phase");
@@ -2424,9 +2320,11 @@ void testIsoModeDeployment(const TemporaryDirectory& temporary) {
              staged.stagedImage->capabilities.rawWrite,
          "staged ISO output should feed the native raw-device backends");
   const rufus::core::WritePlanBuilder rawPlanner;
-  expect(rawPlanner.buildRawWrite(*staged.stagedImage, device,
-                                  4U * 1024U * 1024U, true, true).succeeded(),
-         "staged ISO output should satisfy the shared native raw-write contract");
+  const auto compactCommit = rawPlanner.buildRawWriteWithVerification(
+      *staged.stagedImage, device, rufus::core::VerificationProfile::Standard,
+      4U * 1024U * 1024U, planned.plan->requiresTrailingMetadataClear(), staged.writeRanges);
+  expect(compactCommit.succeeded() && compactCommit.plan->clearTargetTailMetadata(),
+         "compact quick MBR ISO commits must still clear stale trailing metadata");
 
   rufus::core::IsoDeploymentOptions gptOptions;
   gptOptions.partitionScheme = rufus::core::PartitionScheme::Gpt;
@@ -2468,6 +2366,14 @@ void testIsoModeDeployment(const TemporaryDirectory& temporary) {
              gptFatBoot[13U] == 8U,
          "GPT ISO staging should write both GPT headers and honor the 4 KiB cluster: " +
              gptStage.error);
+  checkFatDirectoryParents(gptPath);
+  const auto gptCommit = rawPlanner.buildRawWriteWithVerification(
+      *gptStage.stagedImage, device, rufus::core::VerificationProfile::Standard,
+      4U * 1024U * 1024U, gptPlan.plan->requiresTrailingMetadataClear(), gptStage.writeRanges);
+  expect(gptCommit.succeeded() && !gptCommit.plan->clearTargetTailMetadata() &&
+             gptCommit.plan->bytesToWrite() < device.capacityBytes &&
+             gptStage.writeRanges.back().offsetBytes + gptStage.writeRanges.back().sizeBytes == device.capacityBytes,
+         "GPT ISO commits must preserve the staged backup partition table");
   std::vector<unsigned char> gptHead(2U * 1024U * 1024U);
   std::vector<unsigned char> gptTail(1024U * 1024U);
   gptInput.clear();
@@ -2540,10 +2446,16 @@ void testIsoModeDeployment(const TemporaryDirectory& temporary) {
   const auto fullIsoPath = temporary.path() / "full-iso-stage.img";
   const auto fullStage = stager.stage(*fullPlan.plan, fullIsoPath);
   expect(fullStage.success &&
+             fullStage.writeRanges.empty() &&
              fullStage.stagedImage->sizeBytes == device.capacityBytes &&
              std::filesystem::file_size(fullIsoPath) == device.capacityBytes,
          "full ISO format should produce a complete-device zero-fill image: " +
              fullStage.error);
+  const auto fullCommit = rawPlanner.buildRawWriteWithVerification(
+      *fullStage.stagedImage, device, rufus::core::VerificationProfile::Full,
+      4U * 1024U * 1024U, fullPlan.plan->requiresTrailingMetadataClear(), fullStage.writeRanges);
+  expect(fullCommit.succeeded() && !fullCommit.plan->clearTargetTailMetadata(),
+         "full-format ISO commits must accept a complete-device image without a trailing gap");
 
   auto validationAssets =
       std::make_shared<rufus::core::RuntimeUefiValidationAssets>();
@@ -2933,6 +2845,11 @@ void testLinuxPersistence(const TemporaryDirectory& temporary) {
   expect(staged.stagedImage->sizeBytes == device.capacityBytes &&
              std::filesystem::file_size(outputPath) == device.capacityBytes,
          "a persistence stage should span the complete target layout");
+  const auto debianCommit = rufus::core::WritePlanBuilder{}.buildRawWriteWithVerification(
+      *staged.stagedImage, device, rufus::core::VerificationProfile::Standard,
+      4U * 1024U * 1024U, planned.plan->requiresTrailingMetadataClear(), staged.writeRanges);
+  expect(debianCommit.succeeded() && !debianCommit.plan->clearTargetTailMetadata(),
+         "quick MBR Debian persistence must commit without requiring an unused trailing region");
 
   std::ifstream input(outputPath, std::ios::binary);
   std::array<unsigned char, 512> mbr{};
@@ -3015,6 +2932,17 @@ void testLinuxPersistence(const TemporaryDirectory& temporary) {
   expect(casperStaged.success,
          "Casper ISO persistence should stage successfully: " +
              casperStaged.error);
+  const auto casperCommit = rufus::core::WritePlanBuilder{}.buildRawWriteWithVerification(
+      *casperStaged.stagedImage, device, rufus::core::VerificationProfile::Standard,
+      4U * 1024U * 1024U, integratedCasperPlan.plan->requiresTrailingMetadataClear(), casperStaged.writeRanges);
+  expect(casperCommit.succeeded() && !casperCommit.plan->clearTargetTailMetadata() &&
+             casperCommit.plan->bytesToWrite() < device.capacityBytes / 4U,
+         "quick MBR Casper persistence must skip free space and retain the metadata ranges");
+  expect(!rufus::core::WritePlanBuilder{}.buildRawWriteWithVerification(
+              *casperStaged.stagedImage, device,
+              rufus::core::VerificationProfile::Standard,
+              4U * 1024U * 1024U, true).succeeded(),
+         "the raw planner must continue rejecting tail clearing that overlaps persistence data");
 
   const auto grub2IsoPath = temporary.path() / "grub2-persistence.iso";
   writeLinuxPersistenceIsoFixture(grub2IsoPath,
@@ -3105,6 +3033,113 @@ void testLinuxPersistence(const TemporaryDirectory& temporary) {
   expect(casperInput && std::string(casperLabel.data(), casperLabel.size()) ==
                              "casper-rw",
          "Casper persistence should use the casper-rw ext2 label");
+
+  const auto persistenceOffset = static_cast<std::uint64_t>(casperStart) * 512U;
+  casperInput.seekg(static_cast<std::streamoff>(persistenceOffset + 1024U));
+  std::array<unsigned char, 1024> casperSuper{};
+  casperInput.read(reinterpret_cast<char*>(casperSuper.data()), casperSuper.size());
+  expect(casperInput && readLittle16(casperSuper.data() + 52U) == 0U &&
+             readLittle16(casperSuper.data() + 54U) == 20U &&
+             readLittle32(casperSuper.data() + 48U) == readLittle32(casperSuper.data() + 64U),
+         "new ext2 volumes need correct mount counters and an untruncated write timestamp");
+  const auto filesystemBlocks = readLittle32(casperSuper.data() + 4U);
+  const auto groupBlocks = readLittle32(casperSuper.data() + 32U);
+  const auto groupCount = (filesystemBlocks + groupBlocks - 1U) / groupBlocks;
+  const auto inodeTableBytes = static_cast<std::uint64_t>(readLittle32(casperSuper.data() + 40U)) *
+                              readLittle16(casperSuper.data() + 88U);
+  for (std::uint32_t group = 0U; group < groupCount; ++group) {
+    casperInput.seekg(static_cast<std::streamoff>(persistenceOffset + 4096U + group * 32U));
+    std::array<unsigned char, 32> descriptor{};
+    casperInput.read(reinterpret_cast<char*>(descriptor.data()), descriptor.size());
+    const auto tableOffset = persistenceOffset + static_cast<std::uint64_t>(readLittle32(descriptor.data() + 8U)) * 4096U;
+    expect(casperInput && std::any_of(casperStaged.writeRanges.begin(), casperStaged.writeRanges.end(),
+        [&](const auto& range) {
+          return tableOffset >= range.offsetBytes && tableOffset - range.offsetBytes <= range.sizeBytes &&
+                 inodeTableBytes <= range.sizeBytes - (tableOffset - range.offsetBytes);
+        }), "every inode table, including zero-filled unused entries, must be included in the write map");
+  }
+  casperInput.seekg(static_cast<std::streamoff>(persistenceOffset + 4096U));
+  std::array<unsigned char, 32> casperDescriptor{};
+  casperInput.read(reinterpret_cast<char*>(casperDescriptor.data()), casperDescriptor.size());
+  expect(casperInput && readLittle16(casperDescriptor.data() + 16U) == 6U,
+         "the group directory counter must include root and all five shutdown-hook directories");
+  const auto inodeTable = persistenceOffset +
+      static_cast<std::uint64_t>(readLittle32(casperDescriptor.data() + 8U)) * 4096U;
+  std::uint32_t currentInode = 2U;
+  for (const char* component : {"upper", "usr", "lib", "systemd", "system-shutdown",
+                                "90-rufuspp-persistence"}) {
+    casperInput.seekg(static_cast<std::streamoff>(inodeTable + (currentInode - 1U) * 256U));
+    std::array<unsigned char, 256> directoryInode{};
+    casperInput.read(reinterpret_cast<char*>(directoryInode.data()), directoryInode.size());
+    expect(casperInput && (readLittle16(directoryInode.data()) & 0170000U) == 0040000U,
+           "the persistence hook path must contain real directories");
+    const auto block = readLittle32(directoryInode.data() + 40U);
+    casperInput.seekg(static_cast<std::streamoff>(persistenceOffset +
+                                                static_cast<std::uint64_t>(block) * 4096U));
+    std::array<unsigned char, 4096> directory{};
+    casperInput.read(reinterpret_cast<char*>(directory.data()), directory.size());
+    std::uint32_t found = 0U;
+    for (std::size_t offset = 0U; offset + 8U <= directory.size();) {
+      const auto recordBytes = readLittle16(directory.data() + offset + 4U);
+      const auto nameBytes = directory[offset + 6U];
+      expect(recordBytes >= 8U && offset + recordBytes <= directory.size() &&
+                 nameBytes <= recordBytes - 8U, "ext2 hook directory records must be bounded");
+      const std::string name(reinterpret_cast<const char*>(directory.data() + offset + 8U),
+                             nameBytes);
+      if (name == component) {
+        found = readLittle32(directory.data() + offset);
+        break;
+      }
+      offset += recordBytes;
+    }
+    expect(found != 0U, std::string("missing persistence shutdown component: ") + component);
+    currentInode = found;
+  }
+  casperInput.seekg(static_cast<std::streamoff>(inodeTable + (currentInode - 1U) * 256U));
+  std::array<unsigned char, 256> hookInode{};
+  casperInput.read(reinterpret_cast<char*>(hookInode.data()), hookInode.size());
+  const auto hookSize = readLittle32(hookInode.data() + 4U);
+  const auto hookOffset = persistenceOffset +
+      static_cast<std::uint64_t>(readLittle32(hookInode.data() + 40U)) * 4096U;
+  expect(casperInput && readLittle16(hookInode.data()) == 0100755U &&
+             hookSize > 0U && hookSize <= 4096U,
+         "the persistence finalizer must be a bounded executable regular file");
+  casperInput.seekg(static_cast<std::streamoff>(hookOffset));
+  std::string hook(hookSize, '\0');
+  casperInput.read(hook.data(), hook.size());
+  expect(casperInput && hook.find("UUID=$uuid") != std::string::npos &&
+             hook.find("mount -o remount,ro \"$point\"") != std::string::npos &&
+             hook.find("/dev/sda") == std::string::npos,
+         "the shutdown hook must finalize the UUID-pinned filesystem without a disk-number assumption");
+  rufus::core::detail::Ext2FormatOptions verifyOptions{
+      persistenceOffset, 256ULL * 1024ULL * 1024ULL, "casper-rw", false, true};
+  std::string verifyError;
+  expect(rufus::core::detail::verifyExt2Filesystem(casperOutputPath, verifyOptions, verifyError),
+         "the complete persistence hook tree should verify: " + verifyError);
+  {
+    std::fstream corrupt(casperOutputPath, std::ios::binary | std::ios::in | std::ios::out);
+    corrupt.seekp(static_cast<std::streamoff>(persistenceOffset + 4096U + 16U));
+    corrupt.put(1);
+  }
+  expect(!rufus::core::detail::verifyExt2Filesystem(casperOutputPath, verifyOptions, verifyError),
+         "staging verification must reject an incorrect group directory counter");
+  {
+    std::fstream restore(casperOutputPath, std::ios::binary | std::ios::in | std::ios::out);
+    restore.seekp(static_cast<std::streamoff>(persistenceOffset + 4096U + 16U));
+    restore.put(6);
+  }
+  {
+    std::fstream corrupt(casperOutputPath, std::ios::binary | std::ios::in | std::ios::out);
+    corrupt.seekp(static_cast<std::streamoff>(hookOffset));
+    corrupt.put('!');
+  }
+  expect(!rufus::core::detail::verifyExt2Filesystem(casperOutputPath, verifyOptions, verifyError),
+         "staging verification must reject a damaged persistence shutdown hook");
+  {
+    std::fstream restore(casperOutputPath, std::ios::binary | std::ios::in | std::ios::out);
+    restore.seekp(static_cast<std::streamoff>(hookOffset));
+    restore.put(hook.front());
+  }
 
   auto workPath = outputPath;
   workPath += ".persistence-work";

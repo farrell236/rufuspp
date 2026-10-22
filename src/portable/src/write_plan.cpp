@@ -46,10 +46,43 @@ RawWritePlanResult WritePlanBuilder::buildRawWriteWithVerification(
     const ImageInfo& image, const BlockDeviceInfo& target,
     const VerificationProfile verificationProfile,
     const std::size_t blockSize,
-    const bool clearTargetTailMetadata) const {
+    const bool clearTargetTailMetadata,
+    std::vector<RawWriteRange> writeRanges) const {
   RawWritePlanResult result;
   const SafetyPolicy policy;
   appendIssues(result.issues, policy.validateWrite(image, target));
+
+  std::uint64_t transferBytes = image.deploymentSizeBytes();
+  if (!writeRanges.empty()) {
+    bool valid = image.format == ImageFormat::Raw && !image.compressed &&
+                 image.containerPayloadLayout == ContainerPayloadLayout::None &&
+                 image.containerPayloadOffsetBytes == 0U &&
+                 image.containerPayloadSizeBytes == 0U &&
+                 target.logicalSectorSize != 0U &&
+                 writeRanges.size() <= kMaximumRawWriteRanges &&
+                 !clearTargetTailMetadata;
+    transferBytes = 0U;
+    std::uint64_t previousEnd = 0U;
+    for (const auto& range : writeRanges) {
+      if (!valid || range.sizeBytes == 0U || range.offsetBytes < previousEnd ||
+          range.offsetBytes > image.deploymentSizeBytes() ||
+          range.sizeBytes > image.deploymentSizeBytes() - range.offsetBytes ||
+          range.offsetBytes % target.logicalSectorSize != 0U ||
+          range.sizeBytes % target.logicalSectorSize != 0U) {
+        valid = false;
+        break;
+      }
+      previousEnd = range.offsetBytes + range.sizeBytes;
+      // Ordered, disjoint ranges bounded by the source cannot overflow their sum.
+      transferBytes += range.sizeBytes;
+    }
+    if (!valid) {
+      result.issues.push_back({SafetyIssueCode::ModeUnsupported,
+          "Initialized write ranges must be ordered, disjoint, sector-aligned and within an ordinary raw image"});
+    }
+  } else {
+    writeRanges.push_back({0U, image.deploymentSizeBytes()});
+  }
 
   if (!image.capabilities.rawWrite) {
     result.issues.push_back(
@@ -76,7 +109,8 @@ RawWritePlanResult WritePlanBuilder::buildRawWriteWithVerification(
         {SafetyIssueCode::InvalidBlockSize, "Transfer blocks must be between 4 KiB and 64 MiB"});
   }
   if (verificationProfile == VerificationProfile::Full &&
-      image.deploymentSizeBytes() != target.capacityBytes) {
+      (image.deploymentSizeBytes() != target.capacityBytes ||
+       transferBytes != target.capacityBytes)) {
     result.issues.push_back(
         {SafetyIssueCode::ModeUnsupported,
          "Full-device verification requires an image or full-format stage that covers the complete target"});
@@ -114,7 +148,8 @@ RawWritePlanResult WritePlanBuilder::buildRawWriteWithVerification(
 
   if (result.issues.empty()) {
     result.plan = RawWritePlan(image, target, blockSize, verificationProfile,
-                               clearTargetTailMetadata, lastWriteTime);
+                               clearTargetTailMetadata, lastWriteTime,
+                               std::move(writeRanges), transferBytes);
   }
   return result;
 }

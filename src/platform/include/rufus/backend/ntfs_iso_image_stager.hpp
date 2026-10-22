@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -22,6 +23,20 @@ struct NtfsIsoAvailability final {
   bool available{};
   std::string reason;
 };
+
+struct NtfsIsoStagingRequirements final {
+  bool success{};
+  std::uint64_t temporaryBytes{};
+  bool writeSizePending{};
+  std::string error;
+};
+
+// Shared by GUI preflight and the backend's free-space guard. Direct NTFS
+// staging on macOS/Linux holds two files; Windows uses one native VHD and
+// currently writes it densely, even for quick formats.
+[[nodiscard]] NtfsIsoStagingRequirements estimateNtfsIsoStagingRequirements(
+    std::uint64_t expandedImageBytes, std::uint64_t targetCapacityBytes,
+    bool quickFormat);
 
 class NtfsIsoImageStager {
  public:
@@ -43,15 +58,16 @@ struct NtfsIsoLayoutResult final {
   std::string error;
 };
 
-// Creates the sparse MBR skeleton and installs the data-only UEFI:NTFS
-// partition. It does not format or mount the NTFS data partition.
+// Creates an MBR skeleton, with Windows MBR code for BIOS targets and the
+// UEFI:NTFS helper for UEFI targets. Does not format the NTFS partition.
 [[nodiscard]] NtfsIsoLayoutResult createNtfsIsoMbrImage(
-    const std::filesystem::path& outputPath, std::uint64_t capacityBytes);
+    const std::filesystem::path& outputPath, std::uint64_t capacityBytes,
+    core::IsoTargetSystem targetSystem = core::IsoTargetSystem::Uefi);
 
-// Creates an MBR or GPT NTFS data-partition skeleton with the embedded
-// UEFI:NTFS helper partition. It does not format or mount the NTFS partition.
+// GPT supports UEFI only; MBR also supports BIOS and BIOS + UEFI.
 [[nodiscard]] NtfsIsoLayoutResult createNtfsIsoDiskImage(
     const std::filesystem::path& outputPath, std::uint64_t capacityBytes,
-    core::PartitionScheme partitionScheme);
+    core::PartitionScheme partitionScheme,
+    core::IsoTargetSystem targetSystem = core::IsoTargetSystem::Uefi);
 
 }  // namespace rufus::backend

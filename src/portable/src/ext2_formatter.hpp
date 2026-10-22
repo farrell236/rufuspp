@@ -15,6 +15,8 @@
 #include <functional>
 #include <fstream>
 #include <string>
+#include <vector>
+#include "rufus/core/write_range.hpp"
 
 namespace rufus::core::detail {
 
@@ -23,6 +25,9 @@ struct Ext2FormatOptions final {
   std::uint64_t sizeBytes{};
   std::string volumeLabel;
   bool createPersistenceConf{};
+  // Casper hides its backing mount after switch_root. On systemd-based live
+  // systems, finalize that filesystem read-only at the end of shutdown.
+  bool casperShutdownHook{};
 };
 
 using Ext2CancelCallback = std::function<bool()>;
@@ -33,7 +38,8 @@ using Ext2CancelCallback = std::function<bool()>;
 [[nodiscard]] bool writeExt2Filesystem(std::ofstream& output,
                                        const Ext2FormatOptions& options,
                                        const Ext2CancelCallback& isCancelled,
-                                       std::string& error);
+                                       std::string& error,
+                                       std::vector<RawWriteRange>* initializedRanges = nullptr);
 
 [[nodiscard]] bool verifyExt2Filesystem(const std::filesystem::path& imagePath,
                                         const Ext2FormatOptions& options,

@@ -54,7 +54,7 @@ RawWriteResult writeFromSource(const RawWritePlan& plan, RawSourceIo& source,
   RawWriteResult result;
   report(onProgress, RawWriteStage::Revalidating, 0, plan.bytesToWrite());
 
-  if (source.sizeBytes() != plan.bytesToWrite()) {
+  if (source.sizeBytes() != plan.image().deploymentSizeBytes()) {
     result.error = "The opened source size differs from the analyzed image";
     return result;
   }
@@ -65,34 +65,35 @@ RawWriteResult writeFromSource(const RawWritePlan& plan, RawSourceIo& source,
   }
 
   std::vector<unsigned char> buffer(plan.blockSize());
-  while (result.bytesWritten < plan.bytesToWrite()) {
-    if (cancelled(isCancelled)) {
-      result.cancelled = true;
-      result.error = result.destructiveWriteStarted
-                         ? "Write cancelled after the target was partially overwritten"
-                         : "Write cancelled before the target was modified";
-      return result;
-    }
-
-    const std::uint64_t remaining = plan.bytesToWrite() - result.bytesWritten;
-    const std::size_t requested = static_cast<std::size_t>(
-        std::min<std::uint64_t>(remaining, static_cast<std::uint64_t>(buffer.size())));
-    if (!source.readAt(result.bytesWritten, buffer.data(), requested, result.error)) {
-      if (result.error.empty()) {
-        result.error = "The source image changed or could not be read completely";
+  for (const auto& range : plan.writeRanges()) {
+    std::uint64_t withinRange = 0U;
+    while (withinRange < range.sizeBytes) {
+      if (cancelled(isCancelled)) {
+        result.cancelled = true;
+        result.error = result.destructiveWriteStarted
+                           ? "Write cancelled after the target was partially overwritten"
+                           : "Write cancelled before the target was modified";
+        return result;
       }
-      return result;
-    }
-
-    if (!target.writeAt(result.bytesWritten, buffer.data(), requested, result.error)) {
-      if (result.error.empty()) {
-        result.error = "The target device rejected a write";
+      const auto requested = static_cast<std::size_t>(std::min<std::uint64_t>(
+          range.sizeBytes - withinRange, buffer.size()));
+      const auto offset = range.offsetBytes + withinRange;
+      if (!source.readAt(offset, buffer.data(), requested, result.error)) {
+        if (result.error.empty()) {
+          result.error = "The source image changed or could not be read completely";
+        }
+        return result;
       }
-      return result;
+      // Native I/O may modify a prefix before reporting failure.
+      result.destructiveWriteStarted = true;
+      if (!target.writeAt(offset, buffer.data(), requested, result.error)) {
+        if (result.error.empty()) result.error = "The target device rejected a write";
+        return result;
+      }
+      withinRange += requested;
+      result.bytesWritten += requested;
+      report(onProgress, RawWriteStage::Writing, result.bytesWritten, plan.bytesToWrite());
     }
-    result.destructiveWriteStarted = true;
-    result.bytesWritten += requested;
-    report(onProgress, RawWriteStage::Writing, result.bytesWritten, plan.bytesToWrite());
   }
 
   std::uint64_t tailBytes = 0;
@@ -136,37 +137,42 @@ RawWriteResult writeFromSource(const RawWritePlan& plan, RawSourceIo& source,
     std::vector<unsigned char> targetBuffer(plan.blockSize());
     std::uint64_t verified = 0;
     std::uint64_t blockIndex = 0;
-    const std::uint64_t blockCount =
-        (plan.bytesToWrite() + plan.blockSize() - 1U) / plan.blockSize();
-    while (verified < plan.bytesToWrite()) {
-      if (cancelled(isCancelled)) {
-        result.cancelled = true;
-        result.error = "Verification cancelled; the image was written but not fully verified";
-        return result;
-      }
-      const std::uint64_t remaining = plan.bytesToWrite() - verified;
-      const std::size_t requested = static_cast<std::size_t>(
-          std::min<std::uint64_t>(remaining, static_cast<std::uint64_t>(buffer.size())));
-      const bool verifyBlock = shouldVerifyBlock(
-          plan.verificationProfile(), blockIndex, blockCount);
-      if (!source.readAt(verified, buffer.data(), requested, result.error) ||
-          (verifyBlock &&
-           (!target.readAt(verified, targetBuffer.data(), requested, result.error) ||
-            !std::equal(buffer.begin(),
-                        buffer.begin() +
-                            static_cast<std::ptrdiff_t>(requested),
-                        targetBuffer.begin())))) {
-        if (result.error.empty()) {
-          result.error = "Target verification failed";
+    std::uint64_t blockCount = 0U;
+    for (const auto& range : plan.writeRanges()) {
+      blockCount += range.sizeBytes / plan.blockSize() +
+                    (range.sizeBytes % plan.blockSize() != 0U ? 1U : 0U);
+    }
+    for (const auto& range : plan.writeRanges()) {
+      std::uint64_t withinRange = 0U;
+      while (withinRange < range.sizeBytes) {
+        if (cancelled(isCancelled)) {
+          result.cancelled = true;
+          result.error = "Verification cancelled; the image was written but not fully verified";
+          return result;
         }
-        return result;
+        const auto requested = static_cast<std::size_t>(std::min<std::uint64_t>(
+            range.sizeBytes - withinRange, buffer.size()));
+        const auto offset = range.offsetBytes + withinRange;
+        // Fast sampling must still include the boundaries of every metadata range.
+        const bool verifyBlock = shouldVerifyBlock(
+            plan.verificationProfile(), blockIndex, blockCount) ||
+            (plan.verificationProfile() == VerificationProfile::Fast &&
+             (withinRange == 0U || requested == range.sizeBytes - withinRange));
+        if (!source.readAt(offset, buffer.data(), requested, result.error) ||
+            (verifyBlock &&
+             (!target.readAt(offset, targetBuffer.data(), requested, result.error) ||
+              !std::equal(buffer.begin(),
+                          buffer.begin() + static_cast<std::ptrdiff_t>(requested),
+                          targetBuffer.begin())))) {
+          if (result.error.empty()) result.error = "Target verification failed";
+          return result;
+        }
+        if (verifyBlock) result.bytesVerified += requested;
+        withinRange += requested;
+        verified += requested;
+        ++blockIndex;
+        report(onProgress, RawWriteStage::Verifying, verified, plan.bytesToWrite());
       }
-      if (verifyBlock) {
-        result.bytesVerified += requested;
-      }
-      verified += requested;
-      ++blockIndex;
-      report(onProgress, RawWriteStage::Verifying, verified, plan.bytesToWrite());
     }
     if (tailBytes != 0) {
       std::fill(buffer.begin(), buffer.end(), 0);
@@ -200,7 +206,6 @@ RawWriteResult writeFromSource(const RawWritePlan& plan, RawSourceIo& source,
   }
 
   result.success = true;
-  report(onProgress, RawWriteStage::Complete, plan.bytesToWrite(), plan.bytesToWrite());
   return result;
 }
 
@@ -230,6 +235,9 @@ RawWriteResult RawImageWriter::write(const RawWritePlan& plan, RawTargetIo& targ
     result.success = false;
     result.error = finalSourceSafety.issues.front().message;
   }
+  if (result.success) {
+    report(onProgress, RawWriteStage::Complete, plan.bytesToWrite(), plan.bytesToWrite());
+  }
   return result;
 }
 
@@ -237,7 +245,11 @@ RawWriteResult RawImageWriter::write(const RawWritePlan& plan, RawSourceIo& sour
                                      RawTargetIo& target,
                                      const RawWriteProgressCallback& onProgress,
                                      const RawWriteCancelCallback& isCancelled) const {
-  return writeFromSource(plan, source, target, onProgress, isCancelled);
+  auto result = writeFromSource(plan, source, target, onProgress, isCancelled);
+  if (result.success) {
+    report(onProgress, RawWriteStage::Complete, plan.bytesToWrite(), plan.bytesToWrite());
+  }
+  return result;
 }
 
 const char* rawWriteStageName(const RawWriteStage stage) noexcept {

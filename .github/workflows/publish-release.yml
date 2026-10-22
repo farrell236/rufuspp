@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Version without the v prefix, for example 0.1.0
+        description: Version without the v prefix, for example 0.2.0
         required: true
         type: string
       prerelease:
@@ -45,12 +45,16 @@ jobs:
             exit 1
           fi
           if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
-            echo "Enter a version such as 0.1.0 without a v prefix." >&2
+            echo "Enter a version such as 0.2.0 without a v prefix." >&2
             exit 1
           fi
           tag="v$RELEASE_VERSION"
           if git show-ref --verify --quiet "refs/tags/$tag"; then
             echo "Tag $tag already exists." >&2
+            exit 1
+          fi
+          if [[ ! -s "docs/release-notes/$RELEASE_VERSION.md" ]]; then
+            echo "Missing release notes: docs/release-notes/$RELEASE_VERSION.md" >&2
             exit 1
           fi
           echo "version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
@@ -74,6 +78,9 @@ jobs:
       actions: read
       contents: write
     steps:
+      - name: Checkout release notes
+        uses: actions/checkout@v7
+
       - name: Download packaged applications
         uses: actions/download-artifact@v8
         with:
@@ -107,8 +114,10 @@ jobs:
           RELEASE_TAG: ${{ needs.validate.outputs.tag }}
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
         run: |
-          cat > release-notes.md <<EOF
-          Automated Rufus++ $RELEASE_VERSION packages built and tested from commit $RELEASE_SHA.
+          cp "docs/release-notes/$RELEASE_VERSION.md" release-notes.md
+          cat >> release-notes.md <<EOF
+
+          Packages built and tested from commit $RELEASE_SHA.
 
           The macOS DMGs are explicitly unsigned-root development builds for controlled field testing. They run in restricted mode normally and enable physical-device operations only when their bundle executable is launched with sudo. They are not signed or notarized distribution builds.
           EOF

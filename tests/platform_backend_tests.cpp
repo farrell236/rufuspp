@@ -8,12 +8,14 @@
  * (at your option) any later version.
  */
 
+#include <algorithm>
 #include <chrono>
 #include <array>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <string_view>
 
@@ -26,8 +28,48 @@
 #include "rufus/backend/standalone_filesystem_stager.hpp"
 #include "rufus/backend/windows_to_go_image_stager.hpp"
 #include "rufus/core/image_analyzer.hpp"
+#include "../src/platform/src/ntfs_iso_format.hpp"
+
+namespace {
+bool checkNtfsStagingRequirements() {
+  using rufus::backend::estimateNtfsIsoStagingRequirements;
+  constexpr std::uint64_t gib = 1024ULL * 1024ULL * 1024ULL;
+  constexpr std::uint64_t reserve = 256ULL * 1024ULL * 1024ULL;
+#if defined(_WIN32)
+  constexpr std::uint64_t copies = 1;
+  constexpr bool rangeWrites = false;
+#else
+  constexpr std::uint64_t copies = 2;
+  constexpr bool rangeWrites = true;
+#endif
+  const auto quick = estimateNtfsIsoStagingRequirements(10U * gib, 32U * gib, true);
+  const auto full = estimateNtfsIsoStagingRequirements(10U * gib, 32U * gib, false);
+  const auto largerTarget = estimateNtfsIsoStagingRequirements(10U * gib, 64U * gib, true);
+  const auto rounded = estimateNtfsIsoStagingRequirements(11, 32U * gib, true);
+  if (!quick.success || quick.temporaryBytes != copies * 11U * gib + reserve ||
+      quick.writeSizePending != rangeWrites ||
+      !full.success || full.temporaryBytes != copies * 32U * gib + reserve || full.writeSizePending ||
+      !largerTarget.success || largerTarget.temporaryBytes != quick.temporaryBytes ||
+      !rounded.success || rounded.temporaryBytes != copies * 13U + reserve) {
+    std::cerr << "NTFS space/write estimates must match quick/full host staging and round up\n";
+    return false;
+  }
+  const auto maximum = std::numeric_limits<std::uint64_t>::max();
+  for (const auto& overflow : {
+           estimateNtfsIsoStagingRequirements(maximum, 32U * gib, true),
+           estimateNtfsIsoStagingRequirements(gib, maximum, false),
+           estimateNtfsIsoStagingRequirements(gib, (maximum - reserve) / copies + 1U, false)}) {
+    if (overflow.success || overflow.error.empty() || overflow.temporaryBytes != 0) {
+      std::cerr << "Overflowing NTFS space estimates must fail without a wrapped byte count\n";
+      return false;
+    }
+  }
+  return true;
+}
+}  // namespace
 
 int main() {
+  if (!checkNtfsStagingRequirements()) return EXIT_FAILURE;
   const auto backend = rufus::backend::makePlatformBlockDeviceBackend();
   if (!backend) {
     std::cerr << "configured platform must provide a discovery backend\n";
@@ -191,6 +233,37 @@ int main() {
                                std::to_string(nonce) + ".img");
   constexpr std::uint64_t ntfsLayoutBytes =
       64ULL * 1024ULL * 1024ULL;
+#if !defined(_WIN32)
+  const std::string ntfsStagingDisk = "/private/staging/filesystem.ntfs";
+  const std::string ntfsPartitionDevice = ntfsStagingDisk;
+  const auto ntfsQuickCommand = rufus::backend::detail::ntfsIsoFormatCommand(
+      ntfsStagingDisk, true, 0U, "Windows Setup");
+  const auto ntfsFullCommand = rufus::backend::detail::ntfsIsoFormatCommand(
+      ntfsStagingDisk, false, 8192U, "Windows Setup");
+  const auto optionValue = [](const std::vector<std::string>& command,
+                               const std::string& option) {
+    const auto found = std::find(command.begin(), command.end(), option);
+    return found != command.end() && found + 1 != command.end()
+               ? *(found + 1) : std::string{};
+  };
+  if (ntfsQuickCommand.front() != "rufus-mkntfs" ||
+      ntfsQuickCommand.back() != ntfsPartitionDevice ||
+      ntfsFullCommand.back() != ntfsPartitionDevice ||
+      optionValue(ntfsQuickCommand, "-s") != "512" ||
+      optionValue(ntfsQuickCommand, "-p") != "2048" ||
+      optionValue(ntfsQuickCommand, "-S") != "63" ||
+      optionValue(ntfsQuickCommand, "-H") != "255" ||
+      optionValue(ntfsQuickCommand, "-L") != "Windows Setup" ||
+      std::find(ntfsQuickCommand.begin(), ntfsQuickCommand.end(), "-Q") ==
+          ntfsQuickCommand.end() ||
+      !optionValue(ntfsQuickCommand, "-c").empty() ||
+      std::find(ntfsFullCommand.begin(), ntfsFullCommand.end(), "-Q") !=
+          ntfsFullCommand.end() ||
+      optionValue(ntfsFullCommand, "-c") != "8192") {
+    std::cerr << "NTFS formatter must use an ordinary partition file with explicit geometry\n";
+    return EXIT_FAILURE;
+  }
+#endif
   const auto ntfsLayout = rufus::backend::createNtfsIsoMbrImage(
       ntfsLayoutPath, ntfsLayoutBytes);
   if (!ntfsLayout.success) {
@@ -208,6 +281,12 @@ int main() {
       static_cast<std::uint32_t>(mbr[462 + 9]) << 8U |
       static_cast<std::uint32_t>(mbr[462 + 10]) << 16U |
       static_cast<std::uint32_t>(mbr[462 + 11]) << 24U;
+  const auto littleEndian32 = [](const unsigned char* bytes) {
+    return static_cast<std::uint32_t>(bytes[0]) |
+           static_cast<std::uint32_t>(bytes[1]) << 8U |
+           static_cast<std::uint32_t>(bytes[2]) << 16U |
+           static_cast<std::uint32_t>(bytes[3]) << 24U;
+  };
   ntfsImage.seekg(static_cast<std::streamoff>(bootStart) * 512);
   ntfsImage.read(reinterpret_cast<char*>(uefiBootSector.data()),
                  static_cast<std::streamsize>(uefiBootSector.size()));
@@ -215,6 +294,8 @@ int main() {
   std::filesystem::remove(ntfsLayoutPath, ignored);
   if (mbr[510] != 0x55U || mbr[511] != 0xaaU || mbr[446 + 4] != 0x07U ||
       mbr[462 + 4] != 0xefU || bootStart == 0U ||
+      littleEndian32(mbr.data() + 446U + 8U) !=
+          rufus::backend::detail::kNtfsIsoFirstSector ||
       std::string(reinterpret_cast<const char*>(uefiBootSector.data() + 3U),
                   8U) != "mkfs.fat" ||
       uefiBootSector[510] != 0x55U || uefiBootSector[511] != 0xaaU) {
@@ -238,10 +319,14 @@ int main() {
   std::array<unsigned char, 512> protectiveMbr{};
   std::array<char, 8> primaryGpt{};
   std::array<char, 8> backupGpt{};
+  std::array<unsigned char, 128> ntfsGptEntry{};
   gptNtfsImage.read(reinterpret_cast<char*>(protectiveMbr.data()),
                     protectiveMbr.size());
   gptNtfsImage.seekg(512U);
   gptNtfsImage.read(primaryGpt.data(), primaryGpt.size());
+  gptNtfsImage.seekg(2U * 512U);
+  gptNtfsImage.read(reinterpret_cast<char*>(ntfsGptEntry.data()),
+                    ntfsGptEntry.size());
   gptNtfsImage.seekg(static_cast<std::streamoff>(ntfsLayoutBytes - 512U));
   gptNtfsImage.read(backupGpt.data(), backupGpt.size());
   gptNtfsImage.close();
@@ -250,6 +335,9 @@ int main() {
       analyzedGptNtfs.image->partitionScheme !=
           rufus::core::PartitionScheme::Gpt ||
       protectiveMbr[450U] != 0xeeU ||
+      littleEndian32(ntfsGptEntry.data() + 32U) !=
+          rufus::backend::detail::kNtfsIsoFirstSector ||
+      littleEndian32(ntfsGptEntry.data() + 36U) != 0U ||
       std::string(primaryGpt.data(), primaryGpt.size()) != "EFI PART" ||
       std::string(backupGpt.data(), backupGpt.size()) != "EFI PART") {
     std::cerr << "GPT NTFS staging layout did not validate both GPT headers\n";

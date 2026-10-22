@@ -51,6 +51,7 @@ struct DeploymentPreflightInput final {
   bool quickFormat{};
   VerificationProfile verificationProfile{VerificationProfile::Standard};
   std::uint64_t bytesToWrite{};
+  bool writeSizePending{};
   std::uint64_t temporaryBytes{};
   std::vector<std::string> transformations;
   std::vector<std::string> warnings;

@@ -46,6 +46,8 @@
 #include <vector>
 
 #include "rufus/core/image_analyzer.hpp"
+#include "system_raw_io.hpp"
+#include "raw_write_safety.hpp"
 
 namespace rufus::backend {
 
@@ -147,100 +149,8 @@ bool cancelled(const core::RawWriteCancelCallback& callback) {
   return callback && callback();
 }
 
-bool validOffset(const std::uint64_t offset) {
-  return offset <= static_cast<std::uint64_t>(std::numeric_limits<off_t>::max());
-}
-
-bool positionalRead(const int descriptor, const std::uint64_t offset,
-                    unsigned char* data, const std::size_t size,
-                    std::string& error) {
-  if (!validOffset(offset) || size > static_cast<std::size_t>(SSIZE_MAX)) {
-    error = "Raw read exceeds the platform offset limit";
-    return false;
-  }
-  std::size_t completed = 0;
-  while (completed < size) {
-    const ssize_t count = pread(descriptor, data + completed, size - completed,
-                                static_cast<off_t>(offset + completed));
-    if (count < 0 && errno == EINTR) {
-      continue;
-    }
-    if (count <= 0) {
-      error = count == 0 ? "Unexpected end of the raw source or target"
-                         : errorMessage("Raw read failed");
-      return false;
-    }
-    completed += static_cast<std::size_t>(count);
-  }
-  return true;
-}
-
-bool positionalWrite(const int descriptor, const std::uint64_t offset,
-                     const unsigned char* data, const std::size_t size,
-                     std::string& error) {
-  if (!validOffset(offset) || size > static_cast<std::size_t>(SSIZE_MAX)) {
-    error = "Raw write exceeds the platform offset limit";
-    return false;
-  }
-  std::size_t completed = 0;
-  while (completed < size) {
-    const ssize_t count = pwrite(descriptor, data + completed, size - completed,
-                                 static_cast<off_t>(offset + completed));
-    if (count < 0 && errno == EINTR) {
-      continue;
-    }
-    if (count <= 0) {
-      error = count == 0 ? "The raw target accepted a zero-length write"
-                         : errorMessage("Raw write failed");
-      return false;
-    }
-    completed += static_cast<std::size_t>(count);
-  }
-  return true;
-}
-
-class LinuxRawTarget final : public core::RawTargetIo {
- public:
-  LinuxRawTarget(const int descriptor, const std::uint64_t capacity,
-                 const std::uint32_t sectorSize)
-      : descriptor_(descriptor), capacity_(capacity), sectorSize_(sectorSize) {}
-
-  [[nodiscard]] std::uint64_t capacityBytes() const noexcept override {
-    return capacity_;
-  }
-  [[nodiscard]] std::uint32_t logicalSectorSize() const noexcept override {
-    return sectorSize_;
-  }
-
-  bool writeAt(const std::uint64_t offset, const unsigned char* data,
-               const std::size_t size, std::string& error) override {
-    return positionalWrite(descriptor_, offset, data, size, error);
-  }
-
-  bool readAt(const std::uint64_t offset, unsigned char* data,
-              const std::size_t size, std::string& error) override {
-    return positionalRead(descriptor_, offset, data, size, error);
-  }
-
-  bool flush(std::string& error) override {
-    if (fsync(descriptor_) != 0) {
-      error = errorMessage("Unable to flush the target device");
-      return false;
-    }
-    // Drop buffered block data before verification so reads are issued to the
-    // device rather than being satisfied by the writes we just cached.
-    if (ioctl(descriptor_, BLKFLSBUF, 0) != 0) {
-      error = errorMessage("Unable to invalidate the target block cache");
-      return false;
-    }
-    return true;
-  }
-
- private:
-  int descriptor_;
-  std::uint64_t capacity_;
-  std::uint32_t sectorSize_;
-};
+using detail::positionalRead;
+using LinuxRawTarget = detail::SystemRawTarget;
 
 class LinuxRawSource final : public core::RawSourceIo {
  public:
@@ -1081,12 +991,9 @@ core::RawWriteResult LinuxBlockDeviceBackend::writeRaw(
     result.error = "The selected target is no longer connected";
     return result;
   }
-  const core::SafetyPolicy safetyPolicy;
-  const auto identity = safetyPolicy.validateIdentity(plan.target(), *observed);
-  const auto writeSafety = safetyPolicy.validateWrite(plan.image(), *observed);
-  if (!identity.safe() || !writeSafety.safe()) {
-    result.error = !identity.safe() ? identity.issues.front().message
-                                    : writeSafety.issues.front().message;
+  const auto targetSafety = detail::validateRawWriteTarget(plan, *observed);
+  if (!targetSafety.safe()) {
+    result.error = targetSafety.issues.front().message;
     return result;
   }
 
@@ -1115,7 +1022,7 @@ core::RawWriteResult LinuxBlockDeviceBackend::writeRaw(
     result.error = "The target disappeared after its volumes were unmounted";
     return result;
   }
-  const auto finalIdentity = safetyPolicy.validateIdentity(plan.target(), *reobserved);
+  const auto finalIdentity = detail::validateRawWriteTarget(plan, *reobserved);
   if (!finalIdentity.safe()) {
     result.error = finalIdentity.issues.front().message;
     return result;
@@ -1163,21 +1070,22 @@ core::RawWriteResult LinuxBlockDeviceBackend::writeRaw(
   LinuxRawTarget target(targetDescriptor.get(), capacity,
                         static_cast<std::uint32_t>(sectorSize));
   const core::RawImageWriter writer;
-  result = writer.write(plan, *openedSource.source, target, onProgress,
-                        isCancelled);
-  if (result.success) {
-    const auto finalSourceSafety = core::WritePlanBuilder::validateSource(plan);
-    if (!finalSourceSafety.safe()) {
-      result.success = false;
-      result.error = finalSourceSafety.issues.front().message;
-    }
-  }
-  if (result.success && ioctl(targetDescriptor.get(), BLKRRPART, 0) != 0) {
-    result.success = false;
-    result.error = errorMessage(
-        "The image was written and verified, but Linux could not refresh the partition table");
-  }
-  return result;
+  return detail::finishNativeWrite(plan,
+      [&](const auto& progress) {
+        return writer.write(plan, *openedSource.source, target, progress, isCancelled);
+      }, [&](std::string& error) {
+        const auto safety = core::WritePlanBuilder::validateSource(plan);
+        if (!safety.safe()) {
+          error = safety.issues.front().message;
+          return false;
+        }
+        if (ioctl(targetDescriptor.get(), BLKRRPART, 0) != 0) {
+          error = errorMessage(
+              "The image was written and verified, but Linux could not refresh the partition table");
+          return false;
+        }
+        return true;
+      }, onProgress);
 }
 
 }  // namespace

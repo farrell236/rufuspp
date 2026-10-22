@@ -43,6 +43,8 @@ struct RawWriteProgress final {
 struct RawWriteResult final {
   bool success{};
   bool cancelled{};
+  // A failed write may have modified part of a block. True once any target
+  // write is attempted; bytesWritten counts only complete image-block writes.
   bool destructiveWriteStarted{};
   std::uint64_t bytesWritten{};
   std::uint64_t bytesVerified{};

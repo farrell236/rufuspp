@@ -10,6 +10,7 @@ on:
       - 'src/platform/**'
       - 'src/qt/**'
       - 'res/**'
+      - 'third_party/**'
       - 'tests/**'
   pull_request:
     branches: [master]
@@ -21,6 +22,7 @@ on:
       - 'src/platform/**'
       - 'src/qt/**'
       - 'res/**'
+      - 'third_party/**'
       - 'tests/**'
 
 permissions:

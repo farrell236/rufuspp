@@ -26,7 +26,7 @@
 
 namespace rufus::backend::macos::protocol {
 
-inline constexpr std::int64_t kVersion = 6;
+inline constexpr std::int64_t kVersion = 7;
 inline constexpr char kServiceName[] = RUFUSPP_MACOS_HELPER_IDENTIFIER;
 inline constexpr char kDaemonPlistName[] = RUFUSPP_MACOS_HELPER_IDENTIFIER ".plist";
 
@@ -51,6 +51,9 @@ inline constexpr char kBlockSize[] = "block-size";
 inline constexpr char kVerify[] = "verify";
 inline constexpr char kVerificationProfile[] = "verification-profile";
 inline constexpr char kClearTargetTailMetadata[] = "clear-target-tail-metadata";
+inline constexpr char kWriteRanges[] = "write-ranges";
+inline constexpr char kRangeOffset[] = "offset";
+inline constexpr char kRangeSize[] = "size";
 inline constexpr char kPassCount[] = "pass-count";
 inline constexpr char kPass[] = "pass";
 inline constexpr char kMaximumReportedOffsets[] = "maximum-reported-offsets";

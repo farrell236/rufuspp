@@ -111,7 +111,7 @@ place.
 | Raw/DD and supported compressed images | Signed helper, or opt-in unsigned root process for development | Elevated process | Elevated process |
 | Apple macOS installer application | Apple `createinstallmedia` through signed helper, or development root process | Unavailable | Unavailable |
 | FAT32 ISO and standard Windows Setup | Portable stager + native raw writer | Portable stager + native raw writer | Portable stager + native raw writer |
-| NTFS/UEFI:NTFS ISO | `hdiutil`/`mkntfs`/`ntfs-3g` | `losetup`/`mkntfs`/`ntfs-3g`, elevated | DiskPart, elevated |
+| NTFS ISO (BIOS/UEFI) | Bundled direct NTFS library/formatter | Bundled direct NTFS library/formatter | DiskPart, elevated |
 | Linux persistence | Portable FAT32/ext2 stager + native raw writer | Portable FAT32/ext2 stager + native raw writer | Portable FAT32/ext2 stager + native raw writer |
 | Windows To Go | wimlib + host tools + BCD-SYS | wimlib + host tools + BCD-SYS, elevated | wimlib + DiskPart + BCDBoot, elevated |
 | FFU | Analysis only | Analysis only | DISM `/Apply-Ffu`, elevated |
@@ -151,8 +151,16 @@ partition-table refresh, cancellation, and partial-write reporting; there are
 no shell-driven format or mount commands in the UI process. The staging file is
 removed after the native commit or after any recoverable failure. Quick MBR
 plans also clear and verify the final MiB of the target so stale backup GPT
-metadata cannot survive. Full formats and all GPT plans write and verify a
-complete-device image instead.
+metadata cannot survive. Quick GPT and persistence stages retain a complete
+logical source image but supply formatter-authored initialized write ranges.
+The shared writer seeks directly to these offsets and verifies the transferred
+bytes; unallocated gaps are not copied or read back. Every ext2 group's complete
+inode table is included, even where it contains only zeroes. The final MiB is
+copied from the new image to clear stale MBR-target GPT signatures or preserve
+the new GPT backup tables. Full formats still overwrite and verify the complete
+device; ordinary raw/DD images remain byte-for-byte dense copies. The macOS
+signed helper receives typed, bounded ranges through protocol version 7 and
+revalidates them with the same planner before opening the target.
 
 For standard Windows Setup media, the same portable formatter also installs an
 active Windows-compatible MBR and FAT32 BOOTMGR bootstrap when the target has
@@ -177,16 +185,52 @@ macOS/Linux; the deployment algorithm above it is identical on all hosts.
 The app searches for wimlib beside the executable and in safe platform library
 locations. Distribution packages must bundle the library or declare it as a
 dependency before large-WIM support can be considered available in that build.
-For UEFI media with other FAT32-overflow files, the planner selects an NTFS
-layout only when the host staging provider is available. The provider creates
-the selected MBR or GPT layout with an NTFS data partition and an embedded,
-data-only GPL UEFI:NTFS 2.8
-helper partition, then asks the portable core to securely extract and
-byte-verify the optical file tree in the mounted NTFS root. Windows uses a
-temporary fixed-VHD view and DiskPart. Linux uses `losetup`, `mkntfs`, and
-`ntfs-3g`; macOS uses `hdiutil`, `mkntfs`, and `ntfs-3g`. The staging image is
-detached cleanly before its footer is removed or it is passed to the guarded raw
-writer. MBR retains its 32-bit sector limit; GPT includes both table copies.
+For FAT32-overflow files or explicit NTFS selection, the planner selects an NTFS
+layout only when the host staging provider is available. GPT remains UEFI-only.
+For x86/x64 Windows installers with a root BOOTMGR file, MBR supports BIOS-only
+and BIOS + UEFI: the stager installs Windows MBR code, marks NTFS active, and
+installs pinned GPL ms-sys NTFS BOOTMGR code after the filesystem closes. BPB,
+MFT locations and volume serial are preserved; the backup boot sector is updated
+and both boot areas are read back. BIOS-only media has no helper partition.
+UEFI and dual-mode media include the data-only GPL UEFI:NTFS 2.8 helper partition.
+ARM and non-Windows NTFS BIOS requests are rejected. The implementation and
+ordinary-file tests passed on macOS. On 2026-10-21, GUI-created MBR + BIOS/UEFI +
+NTFS Windows 11 media on the physical Kingston reached Windows Setup under both
+EDK2 UEFI and SeaBIOS in QEMU, using the same USB without rewriting between boots.
+Both physical backing devices were read-only with private guest-write overlays.
+BIOS-only layout, Linux/Windows host runtime and actual-machine firmware
+qualification remain pending. On macOS and Linux the portable extractor streams
+ISO files straight into the bundled, statically linked libntfs-3g 2026.9.28 library.
+A private `rufus-mkntfs` beside the executable formats an ordinary partition
+file with explicit sector size and starting LBA. It is never located via PATH.
+No filesystem mount, loop device, macFUSE/FSKit extension, installed ntfs-3g,
+or root access is needed for this staging step. The existing privileged device
+writer still controls the final USB write. Windows retains its temporary fixed
+VHD and native DiskPart path.
+
+The library uses Windows-compatible case-insensitive name lookup, rejects file
+collisions, writes empty/Unicode/large files, closes all file and volume metadata,
+then reopens the filesystem read-only and byte-verifies every file against the
+ISO (including generated unattended-setup content). The allocated-cluster bitmap
+and backup NTFS boot sector determine the quick-format write ranges. The stager
+copies and verifies those ranges into the final MBR/GPT image and includes both
+the optional UEFI:NTFS helper and disk-tail metadata in the write map. A full format retains
+dense zero-fill semantics. MBR retains its 32-bit sector limit; GPT includes both
+table copies. Cancellation/failure deletes the incomplete output and private work
+directory. GUI preflight and the backend free-space guard share the same
+host-specific estimate: macOS/Linux budget two copies of the expanded image size with
+10% headroom per copy plus a shared 256 MiB reserve for quick format, or twice
+target capacity plus that reserve for full format. Windows budgets one native
+staging image (110% of expanded image size for quick, target capacity for full) plus the
+reserve. Arithmetic overflow blocks preflight. Quick NTFS write size is deferred
+on macOS/Linux until allocated ranges are known; Windows retains the known dense
+transfer size. Receipts keep the original preflight and actual outcome counts.
+
+The pinned upstream source archive, published SHA-256, licensing notices and
+build recipe live in `third_party/ntfs-3g` and accompany distribution packages.
+CMake builds only the static library and formatter; no host software is installed.
+This changes standard NTFS ISO deployment. Standalone NTFS formatting and Windows
+To Go retain their separate host-tool dependencies.
 
 A standard `/boot/grub/i386-pc` tree receives the same GPL GRUB 2.14 MBR/core-
 image strategy used by Rufus, with the core image placed before the aligned
@@ -204,6 +248,12 @@ Debian `persistence` plus `/persistence.conf` convention from ISO analysis.
 Recognized GRUB/Syslinux configurations receive `persistent` or `persistence`
 idempotently, and `MD5SUMS`/`md5sum.txt` entries are repaired for changed files.
 No host mount, shell formatter, or retired Win32 formatting code is involved.
+Casper media also receives a systemd shutdown helper inside the persistence
+upper layer. It selects the uniquely matching generated filesystem UUID,
+exposes its otherwise hidden backing mount, syncs it and remounts it read-only
+after services stop. This lets Linux finalize its allocation counters during
+normal shutdown. The stager verifies the helper's complete file/directory tree;
+non-systemd shutdown behavior requires separate validation.
 UEFI boot uses the extracted ISO bootloaders. Standard and common alternate
 GRUB2 i386-pc trees are also bootstrapped for legacy BIOS. Syslinux-only and
 truly distribution-specific loaders remain capability-gated because their
@@ -333,15 +383,17 @@ privilege keep START disabled before destructive I/O.
    target, filesystem, allocation unit, and quick/full format policy are part
    of the validated plan. Credential-free standard-installation
    Windows User Experience options are embedded as `autounattend.xml`. General
-   UEFI ISO payloads that exceed FAT32 limits use NTFS plus UEFI:NTFS when the
-   host tools are available.
+   UEFI ISO payloads that exceed FAT32 limits use NTFS plus UEFI:NTFS through
+   the bundled macOS/Linux library/formatter or Windows DiskPart. Supported MBR
+   Windows media also receives NTFS BOOTMGR BIOS boot code. The same physical
+   dual-mode NTFS USB reached Setup under UEFI and BIOS QEMU firmware.
 8. **Implemented, dependency-gated:** Windows To Go edition selection, Rufus-
    style Windows User Experience customization, unattended configuration,
    GPT/EFI/NTFS staging, WIM/ESD application, boot construction, cancellation,
    and guarded raw commit are wired for Windows, Linux, and macOS. Packaging
    wimlib, NTFS tooling, and BCD-SYS remains distribution work.
 9. **Implemented for UEFI and common GRUB2 BIOS live media:** Linux persistence uses the portable
-   MBR/FAT32 ISO stage, an embedded ext2 formatter, Casper and Debian Live
+   MBR/GPT FAT32 ISO stage, an embedded ext2 formatter, Casper and Debian Live
    conventions, boot-configuration patching, checksum repair, validation,
    cancellation, and the existing native raw commit. Broader fixtures for
    distribution-specific ISO boot layouts remain follow-up work.

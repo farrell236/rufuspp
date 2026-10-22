@@ -4,6 +4,13 @@
 *.efi binary
 *.svg text eol=lf
 
+# Pinned upstream boot code is checksum-verified byte for byte.
+third_party/windows-ntfs-boot/*.h -text whitespace=cr-at-eol
+third_party/windows-ntfs-boot/ntfs.c -text whitespace=cr-at-eol
+# Retain the original upstream license, including its whitespace.
+third_party/ntfs-3g/COPYING.LIB -whitespace
+*.tgz binary
+
 .github export-ignore
 .gitattributes export-ignore
 .gitignore export-ignore

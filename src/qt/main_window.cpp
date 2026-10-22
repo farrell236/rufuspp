@@ -757,6 +757,23 @@ void MainWindow::buildUi() {
       "DD writes require a validated removable target and authorized raw-device access.");
   page->addWidget(progressBar_);
 
+  // Native macOS progress bars do not reliably display their format text.
+  // Keep stage and byte counts in an independent, accessible text widget.
+  operationProgressLabel_ = new QLabel(central);
+  operationProgressLabel_->setObjectName("operationProgress");
+  operationProgressLabel_->setTextFormat(Qt::PlainText);
+  operationProgressLabel_->setWordWrap(true);
+  operationProgressLabel_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+  operationProgressLabel_->setMinimumHeight(
+      operationProgressLabel_->fontMetrics().height() * 2);
+  operationProgressLabel_->hide();
+  page->addWidget(operationProgressLabel_);
+  progressRefreshTimer_ = new QTimer(this);
+  progressRefreshTimer_->setInterval(1000);
+  progressRefreshTimer_->setTimerType(Qt::PreciseTimer);
+  connect(progressRefreshTimer_, &QTimer::timeout,
+          this, &MainWindow::refreshOperationProgress);
+
   logView_ = new QTextEdit(central);
   logView_->setReadOnly(true);
   logView_->setMinimumHeight(90);
@@ -2346,6 +2363,7 @@ void MainWindow::chooseImage() {
   // image armed while the replacement is being checked (or if that check
   // fails). The visible filename and the executable plan must always refer to
   // the same source.
+  operationProgressLabel_->hide();
   selectedImage_.reset();
   selectedMacOsInstaller_.reset();
   latestImageSha256_.clear();
@@ -3115,7 +3133,8 @@ void MainWindow::startWrite() {
       macOsInstallerMode ? "Mac OS Extended (Journaled), then Apple-managed"
       : isoPlan != nullptr
           ? isoPlan->fileSystem() == core::IsoDeploymentFilesystem::Ntfs
-                ? "NTFS + UEFI:NTFS"
+                ? (isoPlan->targetSystem() == core::IsoTargetSystem::Bios
+                       ? "NTFS" : "NTFS + UEFI:NTFS")
                 : "FAT32"
       : windowsToGoMode ? "EFI FAT32 + NTFS"
                         : "Image-defined";
@@ -3126,6 +3145,9 @@ void MainWindow::startWrite() {
                                    : isoPlan != nullptr && isoPlan->quickFormat();
   preflightInput.temporaryBytes =
       isoMode || windowsToGoMode ? target.capacityBytes : 0U;
+  if (isoPlan != nullptr) {
+    configureIsoPreflightSizing(preflightInput, isoPlan->fileSystem());
+  }
   preflightInput.warnings = planningWarnings;
   const auto rawAvailability = macOsInstallerMode && selectedMacOsInstaller_
                                    ? deviceBackend_->macOsInstallerAvailability(
@@ -3165,10 +3187,16 @@ void MainWindow::startWrite() {
     if (isoPlan->fileSystem() == core::IsoDeploymentFilesystem::Ntfs) {
       const auto ntfs = ntfsIsoStager_->availability();
       preflightInput.dependencies.push_back(
-          {"NTFS/UEFI:NTFS staging provider", true, ntfs.available,
+          {"NTFS staging provider", true, ntfs.available,
            ntfs.reason});
-      preflightInput.transformations.emplace_back(
-          "Install the offline UEFI:NTFS helper partition");
+      if (isoPlan->targetSystem() != core::IsoTargetSystem::Bios) {
+        preflightInput.transformations.emplace_back(
+            "Install the offline UEFI:NTFS helper partition");
+      }
+      if (isoPlan->legacyBiosBootstrap() == core::LegacyBiosBootstrap::WindowsBootManager) {
+        preflightInput.transformations.emplace_back(
+            "Install Windows legacy BIOS boot code and its backup boot sector");
+      }
     }
     if (isoPlan->splitsWindowsImage()) {
       const auto splitter = core::createSystemWimSplitter();
@@ -3445,11 +3473,7 @@ void MainWindow::startWrite() {
       auto rawPlanning = builder.buildRawWriteWithVerification(
           *staging.stagedImage, target, verificationProfile,
           4U * 1024U * 1024U,
-          isoPlan->fileSystem() ==
-                                                       core::IsoDeploymentFilesystem::Fat32 &&
-                                                   isoPlan->partitionScheme() ==
-                                                       core::PartitionScheme::Mbr &&
-                                                   isoPlan->quickFormat());
+          isoPlan->requiresTrailingMetadataClear(), staging.writeRanges);
       if (!rawPlanning.succeeded()) {
         for (const auto& issue : rawPlanning.issues) {
           if (!outcome->error.empty()) {
@@ -3546,7 +3570,9 @@ void MainWindow::closeEvent(QCloseEvent* event) {
 
 void MainWindow::handleIsoDeploymentProgress(const core::IsoDeploymentProgress& progress) {
   noteOperationProgress();
-  const QString stage = QString::fromUtf8(core::isoDeploymentStageName(progress.stage));
+  const QString stage = progress.stage == core::IsoDeploymentStage::Complete
+                            ? "Image prepared"
+                            : QString::fromUtf8(core::isoDeploymentStageName(progress.stage));
   int phasePercentage = 0;
   if (progress.totalBytes != 0) {
     phasePercentage = static_cast<int>(
@@ -3579,7 +3605,8 @@ void MainWindow::handleIsoDeploymentProgress(const core::IsoDeploymentProgress& 
   }
   progressBar_->setValue(overall);
   progressBar_->setFormat(stage.toUpper() +
-                          (progress.totalBytes == 0 ? QString{} : " — %p%"));
+                          (progress.totalBytes == 0 ? QString{} : " — %p% overall"));
+  setOperationProgress(stage, progress.bytesProcessed, progress.totalBytes);
   QString status = stage;
   if (!progress.currentPath.empty()) {
     status += ": " + QString::fromStdString(progress.currentPath);
@@ -3591,7 +3618,9 @@ void MainWindow::handleWindowsToGoProgress(
     const backend::WindowsToGoProgress& progress) {
   noteOperationProgress();
   const QString stage =
-      QString::fromUtf8(backend::windowsToGoStageName(progress.stage));
+      progress.stage == backend::WindowsToGoStage::Complete
+          ? "Windows image prepared"
+          : QString::fromUtf8(backend::windowsToGoStageName(progress.stage));
   int phasePercentage = 0;
   if (progress.totalBytes != 0) {
     phasePercentage = static_cast<int>(
@@ -3624,7 +3653,8 @@ void MainWindow::handleWindowsToGoProgress(
   }
   progressBar_->setValue(overall);
   progressBar_->setFormat(stage.toUpper() +
-                          (progress.totalBytes == 0 ? QString{} : " — %p%"));
+                          (progress.totalBytes == 0 ? QString{} : " — %p% overall"));
+  setOperationProgress(stage, progress.bytesProcessed, progress.totalBytes);
   statusBar()->showMessage(progress.detail.empty()
                                ? stage
                                : QString::fromStdString(progress.detail));
@@ -3671,6 +3701,7 @@ void MainWindow::handleBadBlockProgress(
   }
   progressBar_->setValue(std::clamp(percentage, 0, 100));
   progressBar_->setFormat(stage.toUpper() + " — %p%");
+  setOperationProgress(stage, progress.bytesProcessed, progress.totalBytes);
   statusBar()->showMessage(
       QString("%1 — pass %2 of %3")
           .arg(stage)
@@ -3682,7 +3713,9 @@ void MainWindow::handleStandaloneMediaProgress(
     const core::StandaloneMediaProgress& progress) {
   noteOperationProgress();
   const QString stage =
-      QString::fromUtf8(core::standaloneMediaStageName(progress.stage));
+      progress.stage == core::StandaloneMediaStage::Complete
+          ? "Filesystem prepared"
+          : QString::fromUtf8(core::standaloneMediaStageName(progress.stage));
   int percentage = 0;
   if (progress.totalBytes != 0U) {
     percentage = static_cast<int>(
@@ -3692,6 +3725,7 @@ void MainWindow::handleStandaloneMediaProgress(
   progressBar_->setValue(std::clamp(percentage, 0, 100));
   progressBar_->setFormat(stage.toUpper() +
                           (progress.totalBytes == 0U ? QString{} : " — %p%"));
+  setOperationProgress(stage, progress.bytesProcessed, progress.totalBytes);
   statusBar()->showMessage(stage);
 }
 
@@ -3730,6 +3764,14 @@ void MainWindow::handleMacOsInstallerProgress(
       break;
   }
   progressBar_->setValue(overall);
+  if (progress.stage == core::MacOsInstallerStage::CreatingInstaller) {
+    // createinstallmedia reports percentage units, not transferred bytes.
+    setOperationProgress(stage + QString(" — %1%").arg(phase));
+  } else if (progress.stage == core::MacOsInstallerStage::Complete) {
+    setOperationProgress(stage);
+  } else {
+    setOperationProgress(stage, progress.bytesProcessed, progress.totalBytes);
+  }
   progressBar_->setFormat(
       stage.toUpper() +
       (progress.totalBytes == 0U ? QString{} : " — %p%"));
@@ -3795,9 +3837,13 @@ void MainWindow::handleWriteProgress(const core::RawWriteProgress& progress) {
       progress.stage == core::RawWriteStage::ClearingTargetMetadata ||
       progress.stage == core::RawWriteStage::Verifying ||
       progress.stage == core::RawWriteStage::VerifyingTargetMetadata) {
-    progressBar_->setFormat(stage.toUpper() + " — %p%");
+    progressBar_->setFormat(stage.toUpper() + " — %p% overall");
+    setOperationProgress(stage, progress.bytesProcessed, progress.totalBytes);
   } else {
     progressBar_->setFormat(stage.toUpper());
+    // Flushing can report all bytes written while the device is still busy.
+    // Do not label waiting stages as 100% complete.
+    setOperationProgress(stage);
   }
   statusBar()->showMessage(stage);
 }
@@ -3842,6 +3888,7 @@ void MainWindow::handleWriteFinished(const core::RawWriteResult& result) {
   if (result.success) {
     progressBar_->setValue(100);
     progressBar_->setFormat("COMPLETE");
+    setOperationProgress("Complete", result.bytesWritten, result.bytesWritten);
     appendLog(wasMacOsInstaller
                   ? "Apple createinstallmedia completed successfully; the target is a bootable macOS installer."
                   : wasFfuDeployment
@@ -3861,7 +3908,7 @@ void MainWindow::handleWriteFinished(const core::RawWriteResult& result) {
                   ? "Windows To Go was applied, boot configured, written, and verified successfully."
                   : wasIsoDeployment
                         ? QString("ISO files were staged to %1, written, and verified successfully.")
-                              .arg(wasNtfsIsoDeployment ? "NTFS/UEFI:NTFS"
+                              .arg(wasNtfsIsoDeployment ? "NTFS"
                                                        : "FAT32")
                         : "Raw image write and verification completed successfully.");
     QMessageBox::information(this, "Write complete",
@@ -3885,11 +3932,12 @@ void MainWindow::handleWriteFinished(const core::RawWriteResult& result) {
                                  : wasIsoDeployment
                                  ? QString("ISO-mode %1 deployment and verification completed successfully.")
                                        .arg(wasNtfsIsoDeployment
-                                                ? "NTFS/UEFI:NTFS"
+                                                ? "NTFS"
                                                 : "FAT32")
                                  : "The image was written and verified successfully.");
   } else {
     progressBar_->setFormat(result.cancelled ? "CANCELLED" : "WRITE FAILED");
+    setOperationProgress(result.cancelled ? "Cancelled" : "Write failed");
     QString message = QString::fromStdString(result.error);
     if (result.destructiveWriteStarted) {
       message += "\n\nThe target was already modified and may contain an incomplete image.";
@@ -4059,6 +4107,14 @@ core::VerificationProfile MainWindow::selectedVerificationProfile() const {
 }
 
 void MainWindow::beginOperationGuard() {
+  operationElapsed_.start();
+  progressElapsedMs_ = 0;
+  progressStage_.clear();
+  operationProgressLabel_->hide();
+  progressRefreshTimer_->start();
+  if (writeThread_ != nullptr) {
+    setOperationProgress("Preparing");
+  }
   noteOperationProgress();
   stallWarningIssued_ = false;
   if (operationWatchdog_ != nullptr) {
@@ -4102,6 +4158,14 @@ void MainWindow::beginOperationGuard() {
 }
 
 void MainWindow::endOperationGuard() {
+  if (operationElapsed_.isValid()) {
+    progressElapsedMs_ = operationElapsed_.elapsed();
+    operationElapsed_.invalidate();
+  }
+  if (progressRefreshTimer_ != nullptr) {
+    progressRefreshTimer_->stop();
+  }
+  refreshOperationProgress();
   if (operationWatchdog_ != nullptr) {
     operationWatchdog_->stop();
   }
@@ -4128,6 +4192,58 @@ void MainWindow::noteOperationProgress() {
     stallWarningIssued_ = false;
   }
   lastOperationProgressMs_ = QDateTime::currentMSecsSinceEpoch();
+}
+
+void MainWindow::setOperationProgress(const QString& stage,
+                                      const std::uint64_t completed,
+                                      const std::uint64_t total) {
+  progressStage_ = stage;
+  progressCompleted_ = std::min(completed, total);
+  progressTotal_ = total;
+  refreshOperationProgress();
+  if (operationProgressLabel_->isHidden()) {
+    operationProgressLabel_->show();
+    scheduleWindowFitToContents();
+  }
+}
+
+void MainWindow::refreshOperationProgress() {
+  if (operationProgressLabel_ == nullptr || progressStage_.isEmpty()) {
+    return;
+  }
+  QString title = progressStage_;
+  QStringList details;
+  if (progressTotal_ != 0U) {
+    const auto percentage = static_cast<int>(
+        static_cast<long double>(progressCompleted_) * 100.0L /
+        static_cast<long double>(progressTotal_));
+    title += QString(" — %1%").arg(percentage);
+    details << QString("%1 of %2")
+                   .arg(QString::fromStdString(core::formatByteSize(progressCompleted_)),
+                        QString::fromStdString(core::formatByteSize(progressTotal_)));
+  }
+  const qint64 seconds = (operationElapsed_.isValid()
+                             ? operationElapsed_.elapsed() : progressElapsedMs_) / 1000;
+  details << QString("Elapsed %1:%2")
+                 .arg(seconds / 60, 2, 10, QChar('0'))
+                 .arg(seconds % 60, 2, 10, QChar('0'));
+  operationProgressLabel_->setText(title + '\n' + details.join(" · "));
+}
+
+void MainWindow::configureIsoPreflightSizing(
+    core::DeploymentPreflightInput& input,
+    const core::IsoDeploymentFilesystem fileSystem) {
+  input.writeSizePending = input.quickFormat;
+  if (fileSystem == core::IsoDeploymentFilesystem::Ntfs) {
+    const auto requirements = backend::estimateNtfsIsoStagingRequirements(
+        input.image.expandedSizeBytes, input.target.capacityBytes,
+        input.quickFormat);
+    input.temporaryBytes = requirements.temporaryBytes;
+    input.writeSizePending = requirements.writeSizePending;
+    if (!requirements.success) {
+      input.blockers.push_back(requirements.error);
+    }
+  }
 }
 
 void MainWindow::saveDeploymentReceipt(const core::RawWriteResult& result) {
@@ -4621,7 +4737,7 @@ void MainWindow::updateWriteReadiness() {
           ? "Select a Windows edition and user-experience options, apply it to a GPT/NTFS "
             "portable installation, configure UEFI boot files, then write and verify it."
           : isoMode
-                ? "Create a bootable MBR/FAT32 or NTFS/UEFI:NTFS layout, extract and verify the ISO files, "
+                ? "Create a bootable FAT32 or NTFS layout for the selected BIOS/UEFI target, extract and verify the ISO files, "
                   "then write and verify it through this platform's native raw-device backend."
                 : "Write and verify the image after an explicit destructive-action confirmation. "
                   "Administrative raw-device access may still be required.");
