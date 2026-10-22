@@ -258,7 +258,7 @@ struct Test final {
 void addRawTests(std::vector<Test>& tests) {
   tests.push_back({"initialized ranges seek over gaps and write required zero metadata", [] {
     Fixture f(2U * kTail, 2U * kTail);
-    std::fill_n(f.bytes.begin(), kBlock, 0U);
+    std::fill_n(f.bytes.begin(), kBlock, static_cast<unsigned char>(0));
     f.source.bytes = f.bytes;
     writeFile(f.sourcePath, f.bytes);
     const std::vector<RawWriteRange> ranges{{0U, kBlock}, {kTail, 2U * kBlock},

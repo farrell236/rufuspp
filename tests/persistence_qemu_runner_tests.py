@@ -247,6 +247,11 @@ class PhysicalWriteGuards(unittest.TestCase):
         struct.pack_into('<H',data,1024+58,1)
         data[1024+56:1024+58]=b'\x53\xef'
         self.media.write_bytes(data)
+        self.code=self.root/'code.fd'
+        self.code.write_bytes(bytes(512))
+        firmware=patch.object(runner.boot,'CODE',self.code)
+        firmware.start()
+        self.addCleanup(firmware.stop)
 
     def test_missing_explicit_physical_write_argument_refuses_before_discovery(self):
         with patch.object(hardware.sys,'argv',['test_physical_usb_persistence.py']), \
