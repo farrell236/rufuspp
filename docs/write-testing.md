@@ -1574,6 +1574,9 @@ byte, and checks VHDX structure and the empty log. This regression failed before
 the fix and passed afterward; all 27 local CTest entries passed. The corrected
 writer then completed the fresh physical VHDX capture/restore recorded above.
 Linux CI installs `qemu-utils` to run the independent decoder regression too.
+VHD inputs explicitly select `force_size_calc=current_size`: older QEMU versions
+otherwise use rounded CHS geometry for unfamiliar creator names. The test still
+requires the declared size and every decoded byte to match the raw baseline.
 These automated checks require neither a device, mount, root access nor a VM.
 
 Earlier failed/interrupted reports, metadata diagnostics, host logs, the rejected
