@@ -96,6 +96,14 @@ option(RUFUSPP_RUN_VIRTUAL_DISK_TESTS
   "Test native transports using automatically created disposable disk images" OFF)
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
+  find_program(RUFUSPP_QEMU_IMG_EXECUTABLE NAMES qemu-img HINTS /opt/homebrew/bin /usr/local/bin)
+  if(RUFUSPP_QEMU_IMG_EXECUTABLE)
+    add_test(NAME media-capture-interop COMMAND ${Python3_EXECUTABLE} -B
+      ${CMAKE_CURRENT_SOURCE_DIR}/media_capture_interop.py
+      --helper $<TARGET_FILE:rufus_plus_plus_backend_core_tests>
+      --qemu-img ${RUFUSPP_QEMU_IMG_EXECUTABLE})
+    set_tests_properties(media-capture-interop PROPERTIES LABELS "integration;capture;image-file" TIMEOUT 120)
+  endif()
   add_test(NAME virtual-disk-runner-safety COMMAND ${Python3_EXECUTABLE} -B
     ${CMAKE_CURRENT_SOURCE_DIR}/virtual_disk_runner_tests.py)
   set_tests_properties(virtual-disk-runner-safety PROPERTIES LABELS "unit;writers;native" TIMEOUT 30)
@@ -103,6 +111,9 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME physical-usb-runner-safety COMMAND ${Python3_EXECUTABLE} -B
       ${CMAKE_CURRENT_SOURCE_DIR}/physical_usb_runner_tests.py)
     set_tests_properties(physical-usb-runner-safety PROPERTIES LABELS "unit;writers;native" TIMEOUT 30)
+    add_test(NAME physical-capture-usb-runner-safety COMMAND ${Python3_EXECUTABLE} -B
+      ${CMAKE_CURRENT_SOURCE_DIR}/physical_capture_usb_runner_tests.py)
+    set_tests_properties(physical-capture-usb-runner-safety PROPERTIES LABELS "unit;capture;native" TIMEOUT 30)
     add_test(NAME qemu-boot-preparation-safety COMMAND ${Python3_EXECUTABLE} -B
       ${CMAKE_CURRENT_SOURCE_DIR}/qemu_boot_tests.py)
     set_tests_properties(qemu-boot-preparation-safety PROPERTIES LABELS "unit;writers;native" TIMEOUT 30)

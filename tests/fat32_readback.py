@@ -68,7 +68,7 @@ class Fat32:
                     if entry[11]==0x0f:pending.append(entry);continue
                     name=entry[:11];lfn=tuple(pending);pending=[]
                     if entry[11]&8 or name in (b'.          ',b'..         '):continue
-                    require(name not in names,'duplicate FAT directory name');names.add(name)
+                    require(name not in names,'duplicate FAT directory name: '+repr(path+(name,)));names.add(name)
                     child=(struct.unpack_from('<H',entry,20)[0]<<16)|struct.unpack_from('<H',entry,26)[0]
                     key=path+(name,)
                     if entry[11]&0x10:

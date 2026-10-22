@@ -78,10 +78,17 @@ private formatter; it does not require macFUSE or a host ntfs-3g installation.
 MBR Windows media supports BIOS and BIOS + UEFI, while GPT is UEFI-only.
 Standalone NTFS formatting and Windows To Go retain separate host dependencies.
 
-The latest local macOS build passes 25 CTest entries. Physical Kingston USB
-checks cover Ubuntu writing/persistence and Windows NTFS boot to Setup under
-QEMU UEFI and BIOS firmware. These results do not qualify other host backends,
-Secure Boot, actual PC firmware, or a complete Windows installation. See the
+With Python 3 and `qemu-img` installed, the latest local macOS build passes 27
+CTest entries. The independent capture test decodes VHD/VHDX through QEMU and
+compares every byte with a raw fixture; it uses ordinary files and requires no
+root access or VM. Linux CI installs `qemu-utils` to run this check too.
+
+Physical Kingston USB checks cover Ubuntu writing/persistence, Windows NTFS boot
+to Setup under QEMU UEFI and BIOS firmware, and full-byte DD/VHD/VHDX
+capture/restore round trips. The capture results include reconnect recoveries;
+macOS disk-interface disappearance after some completed writes remains
+unresolved. These results do not qualify other host backends, Secure Boot,
+actual PC firmware, or a complete Windows installation. See the
 [current qualification snapshot](docs/write-testing.md#current-qualification-snapshot).
 
 Native I/O fault tests, opt-in disposable virtual-disk integration, and the

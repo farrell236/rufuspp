@@ -7,11 +7,13 @@ as separate results.
 
 ## Current qualification snapshot
 
-As of 2026-10-21, the local macOS arm64 development build passes **25/25 CTest
-entries**. Coverage includes writer fault injection, actual ordinary-file I/O,
-NTFS extraction/readback including files over 4 GiB, initialized write ranges,
-GUI progress, preflight/receipt estimates and guarded runner behavior. These
-entries contain multiple test cases; normal CTest does not run physical writes
+As of 2026-10-22, the local macOS arm64 development build passes **27/27 CTest
+entries** with Python 3 and `qemu-img` installed. Coverage includes writer fault
+injection, actual ordinary-file I/O, NTFS extraction/readback including files
+over 4 GiB, initialized write ranges,
+GUI progress, preflight/receipt estimates, independent capture-container decoding
+and guarded runner behavior (including 38 physical capture-runner safety cases).
+These entries contain multiple test cases; normal CTest does not run physical writes
 or mount disposable volumes. A separate privileged-helper configuration builds
 cleanly and its native safety, range-protocol and platform-backend checks pass;
 signed installation/authorization/runtime writes remain untested.
@@ -22,6 +24,11 @@ media reached Windows Setup under GPT/UEFI and, after a user GUI rewrite, under
 both UEFI and BIOS from the same MBR dual-mode USB. Both dual-mode Windows guests
 exited normally and their final boot-metadata checks matched. Windows guest
 writes were isolated in local overlays; the physical backing was read-only.
+
+DD, fixed VHD, dynamic VHD and corrected VHDX physical capture/restore checks
+also passed full-byte readback and all dummy-file checks. These results required
+protected reconnects after some completed writes; the macOS disk-interface
+disappearance remains unresolved and uninterrupted operation is not established.
 
 These are scoped macOS/Kingston/QEMU results. Linux/Windows host runtime, other
 USB hardware/sector sizes, actual-machine firmware, Secure Boot, a separate
@@ -1438,3 +1445,139 @@ MBR + BIOS/UEFI + FAT32 + 2 GiB persistence route on this physical Kingston
 using QEMU's SeaBIOS and non-Secure-Boot EDK2. No destination disk image or
 overlay was used for these boots. Physical-PC firmware, Secure Boot and
 native Linux/Windows writers remain separate qualifications.
+
+### Physical dummy-file capture/restore qualification
+
+Completed on 2026-10-22: DD, fixed VHD, dynamic VHD and dynamic VHDX capture and
+restore data-integrity checks passed on the pinned physical Kingston using
+macOS. Every restored disk matched all 15,472,047,104 baseline bytes, all 82
+fixture files (3,686,568 bytes) and nine directories. The successful results
+include read-only continuations after protected reconnects. The post-write
+macOS disk-interface disappearance remains unexplained; these results do not
+establish uninterrupted operation. The USB was safely ejected after verification.
+
+#### Procedure and safeguards
+
+`tests/test_physical_capture_usb.py` is a manual-only macOS runner for the
+session's disposable Kingston. Its default invocation is read-only preflight.
+Writes require `--erase-authorized-kingston` and matching pinned serial, stable
+identity, vendor/model, exact capacity and sector size. Native discovery and
+`diskutil` independently check the target. CTest registers only mocked safety
+checks; it never invokes a physical write.
+
+`/usr/bin/python3 -B tests/prepare_capture_fixture.py` creates the deterministic
+local fixture, or verifies and reuses it when present. It never opens a device.
+The fixture covers empty/binary files, boundary lengths, Unicode/long names and
+nested/empty directories. The SHA-256 manifest is stored on the Mac in
+`build/capture-roundtrip/fixture-ready.json`; the target record is
+`build/capture-roundtrip/target-readonly.json`.
+
+After authorization, run from the repository in an interactive Terminal:
+
+```sh
+sudo /usr/bin/caffeinate -i /usr/bin/python3 -B tests/test_physical_capture_usb.py --erase-authorized-kingston
+```
+
+The runner formats FAT32 through the production backend, copies the fixture,
+then arms a temporary Disk Arbitration mount-approval guard for that USB. It
+proves that an explicit read-only host mount request is denied. The guard never
+claims or opens the device; production claims and identity checks still apply.
+It matches identity again after reconnects, exits with its supervisor, and is
+removed at completion.
+
+For each format, the runner:
+
+1. Captures through the production macOS backend and verifies the result.
+2. Independently compares decoded VHD/VHDX against the DD baseline with
+   `qemu-img`. QEMU opens only local files in this step.
+3. Formats a blank control and proves the fixture is absent using raw FAT32 reads.
+4. Restores through the production writer with full native verification.
+5. Independently compares every physical disk byte using uncached reads and
+   checks every fixture name, size, hash and directory through a bounded FAT32
+   parser, without mounting the restored filesystem.
+
+The fixture is small, but whole-device capture and restore still process all
+15,472,047,104 bytes. Dynamic containers omit zero blocks rather than arbitrary
+unallocated FAT32 clusters; conversion temporarily requires a raw intermediate.
+`caffeinate` prevents idle sleep only for the command's lifetime.
+
+Progress and evidence are retained in `build/capture-roundtrip/run-*/report.json`;
+`latest-run.txt` names the last run. To resume an authorized write plan, repeat
+the erase flag with `--resume /absolute/run-path`. Completed cases are skipped.
+The runner authenticates the baseline and preserved containers, archives the
+previous report, and refuses existing unverified captures. If native restore
+already completed, it finishes independent checks without repeating that write.
+
+To finish only independent checks of an already completed restore, eject and
+stop before any further capture or write:
+
+```sh
+sudo /usr/bin/python3 -B tests/test_physical_capture_usb.py --verify-restored-usb --resume build/capture-roundtrip/run-n8g7zvpb --wait-for-usb
+```
+
+For a disconnected/ejected USB, start with `--wait-for-usb`, wait for
+`Mount suppression armed. Reconnect the Kingston now`, then reconnect it. For a
+connected, unmounted USB, omit that option. The read-only action cannot be
+combined with the erase flag, authenticates the capture hashes, opens the USB
+read-only, compares bytes and files, then ejects. A zero exit status completes
+only this continuation; overall success remains false until every format has
+passed. This is not permission to disconnect during an active write.
+
+#### Results, failures and the VHDX fix
+
+The final run is `build/capture-roundtrip/run-n8g7zvpb/report.json`, with
+`success: true`, no pending formats and successful ejection. The independent
+acceptance summary is `final-acceptance-20261022.json` beside it. Every format's
+physical readback matched the baseline SHA-256:
+
+`0f135e76de3f621b9186437d0a7cf69f3ff05943aedadf500f4c27e46943b98b`
+
+| Capture | Container SHA-256 | Independent physical readback and fixture checks |
+| --- | --- | --- |
+| DD/raw | Same as baseline above | Passed |
+| Fixed VHD | `58be09dba01fa23fa17e05e1800fd24116d21eb76b562a8b04b6507f986fa3b3` | Passed after protected reconnect |
+| Dynamic VHD | `20177b9ee84f6adf99472c59cba46c8f7013e97e8ef7dba9f8b95670d97e3ab3` | Passed after protected reconnect |
+| Corrected VHDX | `43f722a949e7d0509c4f947c2130f22bc86c7aa021fd42e3e45bed5b225e7ecb` | Passed after protected reconnect |
+
+The first unguarded DD attempt failed byte identity: 8,094 bytes in 45 sectors
+changed after native verification. A full read-only diagnostic attributed the
+observed contents to Spotlight/FSEvents activity; all fixture files and FAT32
+allocation counters remained correct. That attempt remains a failure. Temporary
+mount suppression and direct raw file checks allowed the guarded rerun to pass.
+`tests/inspect_capture_usb_readback.py` records diagnostic sector differences
+without writing, mounting or ejecting the USB. The fixture parser also handles
+recorded macOS AppleDouble short-alias collisions with distinct valid long names;
+ordinary duplicate aliases remain errors.
+
+Fixed/dynamic VHD and corrected VHDX restores passed full native verification,
+then macOS removed the disk interface before the independent reader could open
+it. The user confirmed that the USB stayed connected. Registry/log snapshots
+still showed USB hardware and its storage driver, without a media child; driver
+counters reported no read/write errors or retries. The cause is unconfirmed.
+Protected reconnects completed the independent checks without repeating writes.
+One read-only continuation was interrupted by closing Terminal and subsequently
+restarted successfully. These recoveries do not establish host/USB stability.
+
+The first VHDX capture passed Rufus++'s own decoder but QEMU rejected its zero
+`LogOffset`/`LogLength` before any VHDX restore. See QEMU's
+[VHDX log parser](https://raw.githubusercontent.com/qemu/qemu/master/block/vhdx-log.c)
+and Microsoft's [header specification](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-vhdx/39d641c2-093c-4d4a-8c9d-bd4b9fc2ff31).
+An APFS diagnostic clone with corrected log fields/checksums decoded identically
+to the baseline without changing payload blocks. The original rejected capture
+remains preserved as `capture-invalid-log.vhdx`.
+
+The production writer now reserves a non-overlapping, aligned 1 MiB empty log
+after the BAT and records it in both checksummed headers. Native tests assert
+its geometry. With `qemu-img` installed, `media-capture-interop` independently
+decodes ordinary-file fixed VHD, dynamic VHD and VHDX fixtures, compares every
+byte, and checks VHDX structure and the empty log. This regression failed before
+the fix and passed afterward; all 27 local CTest entries passed. The corrected
+writer then completed the fresh physical VHDX capture/restore recorded above.
+Linux CI installs `qemu-utils` to run the independent decoder regression too.
+These automated checks require neither a device, mount, root access nor a VM.
+
+Earlier failed/interrupted reports, metadata diagnostics, host logs, the rejected
+VHDX, diagnostic clone and before/after regression logs remain local under the
+ignored build directory. The results qualify data integrity for this fixture,
+device and host route after recovery. They do not establish bootability, all GUI
+controls, other filesystems, large files, every ISO or another host's backend.

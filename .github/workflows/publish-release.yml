@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Version without the v prefix, for example 0.2.0
+        description: Version without the v prefix, for example 0.2.1
         required: true
         type: string
       prerelease:
@@ -45,7 +45,7 @@ jobs:
             exit 1
           fi
           if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
-            echo "Enter a version such as 0.2.0 without a v prefix." >&2
+            echo "Enter a version such as 0.2.1 without a v prefix." >&2
             exit 1
           fi
           tag="v$RELEASE_VERSION"
